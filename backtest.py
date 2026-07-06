@@ -340,6 +340,25 @@ def simulate_trade(trade: BTTrade, m15: pd.DataFrame) -> BTTrade:
     return trade
 
 
+
+def aggregate_2h_from_1h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    df = df_1h.copy()
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    df = df.set_index("datetime")
+    agg = df.resample("2h", label="left", closed="left").agg({
+        "timestamp": "first" if "timestamp" in df.columns else "size",
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum" if "volume" in df.columns else "size",
+    }).dropna()
+    agg = agg.reset_index()
+    if "timestamp" not in agg.columns or agg["timestamp"].dtype == "object":
+        agg["timestamp"] = (agg["datetime"].astype("int64") // 1_000_000).astype("int64")
+    return agg.sort_values("datetime").reset_index(drop=True)
+
+
 def fetch_df(client, symbol, timeframe, limit):
     return normalize_df(client.fetch_ohlcv_df(symbol, timeframe, limit))
 
@@ -356,11 +375,13 @@ def main():
     history = {}
     for symbol in symbols:
         log.info("Fetching %s", symbol)
+        df_1h = fetch_df(client, symbol, "1h", 2500)
+        df_2h = aggregate_2h_from_1h(df_1h)
         history[symbol] = {
             "1w": fetch_df(client, symbol, "1w", 80),
             "4h": fetch_df(client, symbol, "4h", 1000),
-            "2h": fetch_df(client, symbol, "2h", 1000),
-            "1h": fetch_df(client, symbol, "1h", 2500),
+            "2h": df_2h,
+            "1h": df_1h,
             "15m": fetch_df(client, symbol, "15m", 8000),
         }
         time.sleep(1)
