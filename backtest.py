@@ -346,7 +346,7 @@ def fetch_df(client, symbol, timeframe, limit):
 
 def main():
     client = MexcClient()
-    symbols = list(settings.symbols)
+    symbols = list(settings.backtest_symbol_list if hasattr(settings, 'backtest_symbol_list') else settings.symbol_list)
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=BACKTEST_DAYS)
 
