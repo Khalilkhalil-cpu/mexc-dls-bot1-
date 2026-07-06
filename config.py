@@ -19,13 +19,13 @@ class Settings(BaseSettings):
     enable_dls_type2: bool = True
 
     dls_timeframes: str = "1h,2h"
-    risk_reward: float = 3.0
+    risk_reward: float =2.5
     break_even_r: float = 0.82
     ict_min_score: int = 85
     ict_entry_mode: str = "pb"
     min_score: int = 85
     entry_mode: str = "pb"
-    rr_target: float = 3.0
+    rr_target: float = 2.5
 
     # Risk. User requested 2% for live testing after backtest.
     sizing_mode: str = "risk_percent"
