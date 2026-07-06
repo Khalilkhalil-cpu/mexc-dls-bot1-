@@ -255,39 +255,103 @@ def detect_dls_type1(d: pd.DataFrame, timeframe: str) -> Optional[SimpleSignal]:
 
 
 def detect_dls_candidates(symbol: str, df: pd.DataFrame, timeframe: str, t, weekly_bias, h4_spm):
+    """
+    Extended DLS detector.
+
+    Supports:
+    - Original 3-candle DLS.
+    - Extended DLS where extra candles appear between Candle 2 and the final sweep candle.
+
+    BUY:
+      C1 = reference candle.
+      C2 after C1 sweeps C1 high and closes weak below C1 high.
+      Extra candles between C2 and final sweep are allowed only if they do NOT take C1 high or C1 low.
+      Final sweep candle takes C1 low.
+      Type 1: final candle closes above C2 body top.
+      Type 2: final candle does NOT close above C2 open.
+
+    SELL:
+      Opposite.
+    """
     out = []
     d = df[df["datetime"] <= t].copy().reset_index(drop=True)
     if len(d) < 3:
         return out
 
-    sig1 = detect_dls_type1(d, timeframe)
-    if sig1:
-        tr = make_trade(symbol, "DLS_TYPE1", sig1.side, sig1.entry, sig1.stop_loss, t, weekly_bias, h4_spm)
-        if tr:
-            out.append(tr)
-        return out
+    max_extra = int(os.getenv("DLS_MAX_EXTRA_CANDLES", "3"))
+    last_i = len(d) - 1
+    final_c = d.iloc[last_i]
 
-    c1, c2, c3 = d.iloc[-3], d.iloc[-2], d.iloc[-1]
-    c1_high, c1_low = float(c1["high"]), float(c1["low"])
-    c2_high, c2_low = float(c2["high"]), float(c2["low"])
-    c2_close, c2_open = float(c2["close"]), float(c2["open"])
-    c3_high, c3_low, c3_close = float(c3["high"]), float(c3["low"]), float(c3["close"])
+    # Search for C1/C2 behind the final sweep candle.
+    # C1 -> C2 -> optional inside candles -> final sweep candle.
+    first_c1 = max(0, last_i - max_extra - 2)
 
-    # DLS Type 2: DLS happens but C3 does not close beyond C2 open
-    buy2 = c2_high > c1_high and c2_close < c1_high and c3_low < c1_low and c3_close <= c2_open
-    if buy2:
-        tr = make_trade(symbol, "DLS_TYPE2", "buy", c3_close, c3_low, t, weekly_bias, h4_spm)
-        if tr:
-            out.append(tr)
+    for c1_i in range(first_c1, last_i - 1):
+        c1 = d.iloc[c1_i]
+        c1_high = float(c1["high"])
+        c1_low = float(c1["low"])
 
-    sell2 = c2_low < c1_low and c2_close > c1_low and c3_high > c1_high and c3_close >= c2_open
-    if sell2:
-        tr = make_trade(symbol, "DLS_TYPE2", "sell", c3_close, c3_high, t, weekly_bias, h4_spm)
-        if tr:
-            out.append(tr)
+        for c2_i in range(c1_i + 1, last_i):
+            c2 = d.iloc[c2_i]
+
+            # Any candles between C2 and final candle are allowed only if they stay inside C1 range.
+            middle = d.iloc[c2_i + 1:last_i]
+            if not middle.empty:
+                if bool(((middle["high"] >= c1_high) | (middle["low"] <= c1_low)).any()):
+                    continue
+
+            c2_high = float(c2["high"])
+            c2_low = float(c2["low"])
+            c2_close = float(c2["close"])
+            c2_open = float(c2["open"])
+            c2_body_top = body_high(c2)
+            c2_body_bottom = body_low(c2)
+
+            f_high = float(final_c["high"])
+            f_low = float(final_c["low"])
+            f_close = float(final_c["close"])
+
+            # BUY setup.
+            buy_structure = (
+                c2_high > c1_high and
+                c2_close < c1_high and
+                f_low < c1_low
+            )
+
+            if buy_structure:
+                if f_close > c2_body_top:
+                    tr = make_trade(symbol, "DLS_TYPE1_EXT", "buy", f_close, f_low, t, weekly_bias, h4_spm)
+                    if tr:
+                        out.append(tr)
+                    return out
+
+                if f_close <= c2_open:
+                    tr = make_trade(symbol, "DLS_TYPE2_EXT", "buy", f_close, f_low, t, weekly_bias, h4_spm)
+                    if tr:
+                        out.append(tr)
+                    return out
+
+            # SELL setup.
+            sell_structure = (
+                c2_low < c1_low and
+                c2_close > c1_low and
+                f_high > c1_high
+            )
+
+            if sell_structure:
+                if f_close < c2_body_bottom:
+                    tr = make_trade(symbol, "DLS_TYPE1_EXT", "sell", f_close, f_high, t, weekly_bias, h4_spm)
+                    if tr:
+                        out.append(tr)
+                    return out
+
+                if f_close >= c2_open:
+                    tr = make_trade(symbol, "DLS_TYPE2_EXT", "sell", f_close, f_high, t, weekly_bias, h4_spm)
+                    if tr:
+                        out.append(tr)
+                    return out
 
     return out
-
 
 def simulate_trade(trade: BTTrade, m15: pd.DataFrame) -> BTTrade:
     entry_time = pd.Timestamp(trade.entry_time)
