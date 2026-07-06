@@ -1,446 +1,406 @@
-from __future__ import annotations
-
-import csv
-import json
 import os
+import json
 import time
+import logging
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Tuple
-from zoneinfo import ZoneInfo
+from typing import Optional, Literal
 
-import ccxt
 import pandas as pd
 
 from config import settings
-from logger import log
-from bias_engine import weekly_bias, four_h_spm_allows
-from dls_engine import detect_dls_signals
-from ict_engine import detect_signal as detect_ict_signal
+from mexc_client import MexcClient
+from strategy import detect_dls_signal
 
-VERSION = "master-ict-dls-bot-v3-backtest-timing-fix"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("filtered-backtest")
 
-TF_MS = {
-    "15m": 15 * 60 * 1000,
-    "30m": 30 * 60 * 1000,
-    "1h": 60 * 60 * 1000,
-    "2h": 2 * 60 * 60 * 1000,
-    "4h": 4 * 60 * 60 * 1000,
-    "1d": 24 * 60 * 60 * 1000,
-    "1w": 7 * 24 * 60 * 60 * 1000,
-}
+VERSION = "backtest-weekly-4h-spm-filter-v1"
+Side = Literal["buy", "sell"]
+
+BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
+START_BALANCE = float(os.getenv("BACKTEST_START_BALANCE", "1000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
+RR_TARGET = float(os.getenv("RR_TARGET", "2.0"))
+BREAK_EVEN_R = float(os.getenv("BREAK_EVEN_R", "0.82"))
+USE_WEEKLY_FILTER = os.getenv("USE_WEEKLY_FILTER", "true").lower() == "true"
+USE_4H_SPM_FILTER = os.getenv("USE_4H_SPM_FILTER", "true").lower() == "true"
+
+os.makedirs("logs", exist_ok=True)
 
 
 @dataclass
-class BacktestTrade:
+class BTTrade:
     symbol: str
     strategy: str
-    side: str
-    timeframe: str
+    side: Side
     entry_time: str
     entry: float
     stop: float
     target: float
-    break_even_price: float
-    risk_per_unit: float
-    risk_usdt: float
-    signal_id: str
-    reason: str
-    break_even_moved: bool = False
-    bars_open: int = 0
+    be_price: float
+    weekly_bias: str
+    h4_spm: str
+    allowed: bool
+    reject_reason: str = ""
+    exit_time: str = ""
+    exit_price: float = 0.0
+    result: str = "OPEN"
+    r: float = 0.0
 
 
-class HistoricalClient:
-    def __init__(self):
-        self.exchange = ccxt.mexc({"enableRateLimit": True, "options": {"defaultType": "swap"}})
-        self.exchange.load_markets()
-
-    def fetch_history(self, symbol: str, timeframe: str, since_ms: int, end_ms: int, limit: int = 1000) -> pd.DataFrame:
-        rows = []
-        since = since_ms
-        failures = 0
-        while since < end_ms:
-            try:
-                batch = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit)
-                failures = 0
-            except Exception as exc:
-                msg = str(exc)
-                if "Requests are too frequent" in msg or '"code":510' in msg:
-                    log.warning("Rate limited fetching %s %s, sleeping %ss", symbol, timeframe, settings.rate_limit_backoff_seconds)
-                    time.sleep(settings.rate_limit_backoff_seconds)
-                    continue
-                failures += 1
-                if failures > 3:
-                    raise
-                log.warning("Fetch failed %s %s: %s", symbol, timeframe, exc)
-                time.sleep(3)
-                continue
-
-            if not batch:
-                break
-            rows.extend(batch)
-            last = batch[-1][0]
-            next_since = last + TF_MS[timeframe]
-            if next_since <= since:
-                break
-            since = next_since
-            if len(batch) < 2:
-                break
-            time.sleep(float(settings.request_delay_seconds))
-
-        if not rows:
-            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "datetime"])
-        df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df = df.drop_duplicates("timestamp").sort_values("timestamp")
-        df = df[df["timestamp"] < end_ms].copy()
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "datetime" not in df.columns:
         df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = df[col].astype(float)
-        return df.reset_index(drop=True)
-
-
-def aggregate(df: pd.DataFrame, rule: str, limit: int | None = None) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-    x = df.copy().set_index("datetime")
-    agg = x.resample(rule, label="left", closed="left").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-        "timestamp": "first",
-    }).dropna().reset_index()
-    out = agg[["timestamp", "open", "high", "low", "close", "volume", "datetime"]]
-    if limit:
-        out = out.tail(limit)
-    return out.reset_index(drop=True)
-
-
-def closed_until(df: pd.DataFrame, timeframe: str, now_ms: int, limit: int) -> pd.DataFrame:
-    if df.empty:
-        return df.copy()
-    dur = TF_MS[timeframe]
-    x = df[df["timestamp"] + dur <= now_ms].copy()
-    return x.tail(limit).reset_index(drop=True)
-
-
-def in_new_york_session(ts_utc: pd.Timestamp) -> bool:
-    ny = ts_utc.tz_convert("America/New_York")
-    start = ny.replace(hour=settings.ny_start_hour, minute=0, second=0, microsecond=0)
-    end = ny.replace(hour=settings.ny_end_hour, minute=settings.ny_end_minute, second=0, microsecond=0)
-    return start <= ny <= end
-
-
-def normalize_ict_signal(sig):
-    sig.strategy = "ICT"
-    sig.timeframe = "15m"
-    risk = abs(sig.entry - sig.stop)
-    sig.risk_per_unit = risk
-    sig.break_even_price = sig.entry + risk * settings.break_even_r if sig.side == "buy" else sig.entry - risk * settings.break_even_r
-    sig.signal_id = f"{sig.symbol}|ICT|{sig.side}|{pd.Timestamp(sig.signal_time).isoformat()}|{round(sig.entry,8)}|{round(sig.stop,8)}"
-    return sig
-
-
-
-def signal_confirmation_timeframe(sig) -> str:
-    """Return the candle timeframe that actually confirms this signal.
-
-    Most signal_time values in the engines are the OPEN time of the confirming candle.
-    In backtesting, the signal is only tradable after that candle closes.
-    """
-    strategy = str(getattr(sig, "strategy", "")).upper()
-    tf = str(getattr(sig, "timeframe", "15m")).lower()
-
-    if strategy == "ICT":
-        return "15m"
-    if strategy == "DLS_TYPE1":
-        return tf if tf in TF_MS else "1h"
-    if strategy == "DLS_TYPE2":
-        # 1H Type2 confirms on 15M SPM, 2H Type2 confirms on 30M SPM.
-        if tf == "2h":
-            return "30m"
-        return "15m"
-    return tf if tf in TF_MS else "15m"
-
-
-def signal_available_time(sig) -> pd.Timestamp:
-    """Convert signal_time candle OPEN into the first time the backtester may enter."""
-    sig_time = pd.Timestamp(sig.signal_time)
-    if sig_time.tzinfo is None:
-        sig_time = sig_time.tz_localize("UTC")
-    confirm_tf = signal_confirmation_timeframe(sig)
-    return sig_time + pd.Timedelta(milliseconds=TF_MS[confirm_tf])
-
-
-def build_signals_for_symbol(symbol: str, dfs: Dict[str, pd.DataFrame]):
-    bias, bias_reason = weekly_bias(dfs["1w"], dfs["1d"])
-    if bias not in ("buy", "sell"):
-        return []
-    ok4h, reason4h = four_h_spm_allows(dfs["4h"], bias)
-    if not ok4h:
-        return []
-
-    signals = []
-    if settings.enable_dls:
-        for s in detect_dls_signals(symbol, dfs):
-            if s.side == bias:
-                s.reason = f"{bias_reason}; {reason4h}; {s.reason}"
-                signals.append(s)
-
-    if settings.enable_ict:
-        try:
-            ict, _ = detect_ict_signal(symbol, dfs["1d"], dfs["4h"], dfs["1h"], dfs["15m"])
-            if ict:
-                ict = normalize_ict_signal(ict)
-                if ict.side == bias:
-                    ict.reason = f"{bias_reason}; {reason4h}; {ict.reason}"
-                    signals.append(ict)
-        except Exception:
-            pass
-    return signals
-
-
-def manage_trade_on_bar(trade: BacktestTrade, bar) -> Tuple[bool, str, float, float]:
-    """Return (closed, result, exit_price, r). Conservative assumption: stop is checked before target if both occur in same candle."""
-    high = float(bar.high)
-    low = float(bar.low)
-    trade.bars_open += 1
-
-    if trade.side == "buy":
-        if low <= trade.stop:
-            r = (trade.stop - trade.entry) / trade.risk_per_unit
-            return True, "LOSS" if r < 0 else "BREAKEVEN", trade.stop, r
-        if high >= trade.target:
-            return True, "WIN", trade.target, (trade.target - trade.entry) / trade.risk_per_unit
-        if not trade.break_even_moved and high >= trade.break_even_price:
-            trade.stop = trade.entry
-            trade.break_even_moved = True
     else:
-        if high >= trade.stop:
-            r = (trade.entry - trade.stop) / trade.risk_per_unit
-            return True, "LOSS" if r < 0 else "BREAKEVEN", trade.stop, r
-        if low <= trade.target:
-            return True, "WIN", trade.target, (trade.entry - trade.target) / trade.risk_per_unit
-        if not trade.break_even_moved and low <= trade.break_even_price:
-            trade.stop = trade.entry
-            trade.break_even_moved = True
+        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    return df.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
 
-    if trade.bars_open >= int(settings.backtest_max_hold_bars_15m):
-        exit_price = float(bar.close)
+
+def body_high(row) -> float:
+    return max(float(row["open"]), float(row["close"]))
+
+
+def body_low(row) -> float:
+    return min(float(row["open"]), float(row["close"]))
+
+
+def is_inside_candle(df: pd.DataFrame, i: int) -> bool:
+    if i <= 0:
+        return False
+    c = df.iloc[i]
+    p = df.iloc[i - 1]
+    return float(c["high"]) <= float(p["high"]) and float(c["low"]) >= float(p["low"])
+
+
+def weekly_bias_at(weekly: pd.DataFrame, t) -> str:
+    w = weekly[weekly["datetime"] < t].copy()
+    if len(w) < 3:
+        return "neutral"
+    last_week = w.iloc[-1]
+    prev_week = w.iloc[-2]
+    if float(last_week["close"]) > float(prev_week["high"]):
+        return "buy"
+    if float(last_week["close"]) < float(prev_week["low"]):
+        return "sell"
+    return "neutral"
+
+
+@dataclass
+class SPM:
+    side: Side
+    confirmed_time: object
+    c1_time: object
+    c2_time: object
+    c1_level: float
+    c2_extreme: float
+
+
+def find_valid_bull_c1(df: pd.DataFrame, c2_i: int, max_back: int = 50) -> Optional[int]:
+    c2 = df.iloc[c2_i]
+    start = max(1, c2_i - max_back)
+    for i in range(c2_i - 1, start - 1, -1):
+        c1 = df.iloc[i]
+        if is_inside_candle(df, i):
+            continue
+        if float(c2["low"]) <= float(c1["low"]):
+            continue
+        if float(c2["close"]) < body_low(c1):
+            continue
+        return i
+    return None
+
+
+def find_valid_bear_c1(df: pd.DataFrame, c2_i: int, max_back: int = 50) -> Optional[int]:
+    c2 = df.iloc[c2_i]
+    start = max(1, c2_i - max_back)
+    for i in range(c2_i - 1, start - 1, -1):
+        c1 = df.iloc[i]
+        if is_inside_candle(df, i):
+            continue
+        if float(c2["high"]) >= float(c1["high"]):
+            continue
+        if float(c2["close"]) > body_high(c1):
+            continue
+        return i
+    return None
+
+
+def detect_last_spm(df: pd.DataFrame, t, lookback: int = 160) -> Optional[SPM]:
+    data = df[df["datetime"] < t].copy().reset_index(drop=True)
+    if len(data) < 30:
+        return None
+
+    start = max(5, len(data) - lookback)
+    spms = []
+
+    for c2_i in range(start, len(data) - 1):
+        left = max(0, c2_i - 20)
+        right = min(len(data), c2_i + 21)
+        window = data.iloc[left:right]
+
+        if float(data.iloc[c2_i]["low"]) == float(window["low"].min()):
+            c1_i = find_valid_bull_c1(data, c2_i)
+            if c1_i is not None:
+                c1 = data.iloc[c1_i]
+                level = float(c1["high"])
+                after = data.iloc[c2_i + 1:]
+                confirms = after[after["close"] > level]
+                if not confirms.empty:
+                    conf = confirms.iloc[0]
+                    spms.append(SPM("buy", conf["datetime"], c1["datetime"], data.iloc[c2_i]["datetime"], level, float(data.iloc[c2_i]["low"])))
+
+        if float(data.iloc[c2_i]["high"]) == float(window["high"].max()):
+            c1_i = find_valid_bear_c1(data, c2_i)
+            if c1_i is not None:
+                c1 = data.iloc[c1_i]
+                level = float(c1["low"])
+                after = data.iloc[c2_i + 1:]
+                confirms = after[after["close"] < level]
+                if not confirms.empty:
+                    conf = confirms.iloc[0]
+                    spms.append(SPM("sell", conf["datetime"], c1["datetime"], data.iloc[c2_i]["datetime"], level, float(data.iloc[c2_i]["high"])))
+
+    if not spms:
+        return None
+    spms.sort(key=lambda x: x.confirmed_time)
+    return spms[-1]
+
+
+def h4_spm_side_at(h4: pd.DataFrame, t) -> str:
+    spm = detect_last_spm(h4, t)
+    return spm.side if spm else "none"
+
+
+def passes_filters(side: str, weekly_bias: str, h4_spm: str):
+    reasons = []
+    if USE_WEEKLY_FILTER and weekly_bias != "neutral" and weekly_bias != side:
+        reasons.append(f"weekly mismatch weekly={weekly_bias} trade={side}")
+    if USE_4H_SPM_FILTER:
+        if h4_spm == "none":
+            reasons.append("no 4H SPM")
+        elif h4_spm != side:
+            reasons.append(f"4H SPM mismatch h4={h4_spm} trade={side}")
+    return len(reasons) == 0, "; ".join(reasons)
+
+
+def make_trade(symbol, strategy, side, entry, stop, t, weekly_bias, h4_spm):
+    if side == "buy":
+        risk = entry - stop
+        target = entry + risk * RR_TARGET
+        be = entry + risk * BREAK_EVEN_R
+    else:
+        risk = stop - entry
+        target = entry - risk * RR_TARGET
+        be = entry - risk * BREAK_EVEN_R
+    if risk <= 0:
+        return None
+    allowed, reject_reason = passes_filters(side, weekly_bias, h4_spm)
+    return BTTrade(symbol, strategy, side, str(t), float(entry), float(stop), float(target), float(be), weekly_bias, h4_spm, allowed, reject_reason)
+
+
+def detect_dls_candidates(symbol: str, df: pd.DataFrame, timeframe: str, t, weekly_bias, h4_spm):
+    out = []
+    d = df[df["datetime"] <= t].copy().reset_index(drop=True)
+    if len(d) < 3:
+        return out
+
+    sig1 = detect_dls_signal(d, timeframe=timeframe, risk_reward=RR_TARGET, break_even_r=BREAK_EVEN_R)
+    if sig1:
+        tr = make_trade(symbol, "DLS_TYPE1", sig1.side, sig1.entry, sig1.stop_loss, t, weekly_bias, h4_spm)
+        if tr:
+            out.append(tr)
+        return out
+
+    c1, c2, c3 = d.iloc[-3], d.iloc[-2], d.iloc[-1]
+    c1_high, c1_low = float(c1["high"]), float(c1["low"])
+    c2_high, c2_low = float(c2["high"]), float(c2["low"])
+    c2_close, c2_open = float(c2["close"]), float(c2["open"])
+    c3_high, c3_low, c3_close = float(c3["high"]), float(c3["low"]), float(c3["close"])
+
+    buy2 = c2_high > c1_high and c2_close < c1_high and c3_low < c1_low and c3_close <= c2_open
+    if buy2:
+        tr = make_trade(symbol, "DLS_TYPE2", "buy", c3_close, c3_low, t, weekly_bias, h4_spm)
+        if tr:
+            out.append(tr)
+
+    sell2 = c2_low < c1_low and c2_close > c1_low and c3_high > c1_high and c3_close >= c2_open
+    if sell2:
+        tr = make_trade(symbol, "DLS_TYPE2", "sell", c3_close, c3_high, t, weekly_bias, h4_spm)
+        if tr:
+            out.append(tr)
+
+    return out
+
+
+def simulate_trade(trade: BTTrade, m15: pd.DataFrame) -> BTTrade:
+    entry_time = pd.Timestamp(trade.entry_time)
+    future = m15[m15["datetime"] > entry_time].copy()
+    moved_be = False
+
+    for _, bar in future.iterrows():
+        high = float(bar["high"])
+        low = float(bar["low"])
+        dt = str(bar["datetime"])
+
         if trade.side == "buy":
-            r = (exit_price - trade.entry) / trade.risk_per_unit
+            if not moved_be and high >= trade.be_price:
+                moved_be = True
+            active_stop = trade.entry if moved_be else trade.stop
+
+            if low <= active_stop:
+                trade.exit_time = dt
+                trade.exit_price = active_stop
+                trade.result = "BREAKEVEN" if moved_be else "LOSS"
+                trade.r = 0.0 if moved_be else -1.0
+                return trade
+
+            if high >= trade.target:
+                trade.exit_time = dt
+                trade.exit_price = trade.target
+                trade.result = "WIN"
+                trade.r = RR_TARGET
+                return trade
+
         else:
-            r = (trade.entry - exit_price) / trade.risk_per_unit
-        result = "WIN" if r > 0 else "LOSS" if r < 0 else "BREAKEVEN"
-        return True, f"TIME_EXIT_{result}", exit_price, r
+            if not moved_be and low <= trade.be_price:
+                moved_be = True
+            active_stop = trade.entry if moved_be else trade.stop
 
-    return False, "", 0.0, 0.0
+            if high >= active_stop:
+                trade.exit_time = dt
+                trade.exit_price = active_stop
+                trade.result = "BREAKEVEN" if moved_be else "LOSS"
+                trade.r = 0.0 if moved_be else -1.0
+                return trade
+
+            if low <= trade.target:
+                trade.exit_time = dt
+                trade.exit_price = trade.target
+                trade.result = "WIN"
+                trade.r = RR_TARGET
+                return trade
+
+    return trade
 
 
-def run_backtest():
-    os.makedirs("logs", exist_ok=True)
-    client = HistoricalClient()
-    symbols = [s for s in settings.backtest_symbol_list if s in client.exchange.markets]
-    if not symbols:
-        raise RuntimeError("No valid backtest symbols. Check BACKTEST_SYMBOLS.")
+def fetch_df(client, symbol, timeframe, limit):
+    return normalize_df(client.fetch_ohlcv_df(symbol, timeframe, limit))
 
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=int(settings.backtest_days))
-    log.info("Starting backtest %s | days=%s symbols=%s", VERSION, settings.backtest_days, symbols)
-    log.info("Backtest period UTC: %s -> %s", start_dt.isoformat(), end_dt.isoformat())
 
-    end_ms = int(end_dt.timestamp() * 1000)
-    starts = {
-        "1w": int((start_dt - timedelta(days=400)).timestamp() * 1000),
-        "1d": int((start_dt - timedelta(days=220)).timestamp() * 1000),
-        "4h": int((start_dt - timedelta(days=120)).timestamp() * 1000),
-        "1h": int((start_dt - timedelta(days=70)).timestamp() * 1000),
-        "15m": int((start_dt - timedelta(days=45)).timestamp() * 1000),
-    }
+def main():
+    client = MexcClient()
+    symbols = list(settings.symbols)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=BACKTEST_DAYS)
 
-    data: Dict[str, Dict[str, pd.DataFrame]] = {}
+    log.info("Starting filtered backtest %s | days=%s RR=%s weekly=%s h4spm=%s",
+             VERSION, BACKTEST_DAYS, RR_TARGET, USE_WEEKLY_FILTER, USE_4H_SPM_FILTER)
+
+    history = {}
     for symbol in symbols:
-        log.info("Fetching history for %s", symbol)
-        data[symbol] = {
-            "1w": client.fetch_history(symbol, "1w", starts["1w"], end_ms, limit=1000),
-            "1d": client.fetch_history(symbol, "1d", starts["1d"], end_ms, limit=1000),
-            "4h": client.fetch_history(symbol, "4h", starts["4h"], end_ms, limit=1000),
-            "1h": client.fetch_history(symbol, "1h", starts["1h"], end_ms, limit=1000),
-            "15m": client.fetch_history(symbol, "15m", starts["15m"], end_ms, limit=1000),
+        log.info("Fetching %s", symbol)
+        history[symbol] = {
+            "1w": fetch_df(client, symbol, "1w", 80),
+            "4h": fetch_df(client, symbol, "4h", 1000),
+            "2h": fetch_df(client, symbol, "2h", 1000),
+            "1h": fetch_df(client, symbol, "1h", 2500),
+            "15m": fetch_df(client, symbol, "15m", 8000),
         }
-        log.info("Fetched %s rows: 1w=%s 1d=%s 4h=%s 1h=%s 15m=%s", symbol, len(data[symbol]["1w"]), len(data[symbol]["1d"]), len(data[symbol]["4h"]), len(data[symbol]["1h"]), len(data[symbol]["15m"]))
+        time.sleep(1)
 
-    series_list = []
-    for symbol in symbols:
-        m15 = data[symbol]["15m"]
-        if not m15.empty:
-            series_list.append(m15.loc[m15["datetime"] >= pd.Timestamp(start_dt), "datetime"])
-    if series_list:
-        all_times = sorted(pd.concat(series_list).drop_duplicates().tolist())
-    else:
-        all_times = []
+    candidates = []
 
-    balance = float(settings.backtest_start_balance)
-    open_trades: List[BacktestTrade] = []
-    seen_signals = set()
-    closed_rows = []
+    for symbol, data in history.items():
+        times = data["15m"][(data["15m"]["datetime"] >= pd.Timestamp(start)) & (data["15m"]["datetime"] <= pd.Timestamp(now))]["datetime"]
 
-    total_bars = len(all_times)
-    log.info("Starting candle replay: bars=%s symbols=%s", total_bars, len(symbols))
+        for idx, t in enumerate(times):
+            if idx % 500 == 0:
+                log.info("Replay %s progress %s/%s candidates=%s", symbol, idx, len(times), len(candidates))
 
-    for bar_i, ts in enumerate(all_times, start=1):
-        now_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+            if int(t.minute) == 0:
+                wb = weekly_bias_at(data["1w"], t)
+                h4s = h4_spm_side_at(data["4h"], t)
+                candidates.extend(detect_dls_candidates(symbol, data["1h"], "1h", t, wb, h4s))
 
-        if bar_i == 1 or bar_i % 250 == 0 or bar_i == total_bars:
-            log.info(
-                "Backtest progress: %s/%s | time=%s | open=%s | closed=%s | balance=%.2f",
-                bar_i, total_bars, pd.Timestamp(ts).isoformat(), len(open_trades), len(closed_rows), balance
-            )
+            if int(t.minute) == 0 and int(t.hour) % 2 == 0:
+                wb = weekly_bias_at(data["1w"], t)
+                h4s = h4_spm_side_at(data["4h"], t)
+                candidates.extend(detect_dls_candidates(symbol, data["2h"], "2h", t, wb, h4s))
 
-        # Manage all open trades on each 15m bar.
-        for trade in list(open_trades):
-            m15 = data[trade.symbol]["15m"]
-            bar_rows = m15[m15["datetime"] == ts]
-            if bar_rows.empty:
-                continue
-            closed, result, exit_price, r = manage_trade_on_bar(trade, bar_rows.iloc[0])
-            if closed:
-                pnl = r * trade.risk_usdt
-                balance += pnl
-                row = {
-                    **asdict(trade),
-                    "exit_time": pd.Timestamp(ts).isoformat(),
-                    "exit_price": exit_price,
-                    "result": result,
-                    "r": r,
-                    "pnl_usdt": pnl,
-                    "balance_after": balance,
-                }
-                log.warning(
-                    "BACKTEST EXIT %s %s result=%s r=%.2f exit=%.8f balance=%.2f",
-                    trade.strategy, trade.symbol, result, r, exit_price, balance
-                )
-                closed_rows.append(row)
-                open_trades.remove(trade)
+    # dedupe
+    unique = {}
+    for tr in candidates:
+        key = (tr.symbol, tr.strategy, tr.side, tr.entry_time, round(tr.entry, 8), round(tr.stop, 8))
+        unique[key] = tr
+    candidates = list(unique.values())
 
-        if settings.backtest_use_newyork_session and not in_new_york_session(pd.Timestamp(ts)):
-            continue
-        if len(open_trades) >= int(settings.backtest_max_open_positions):
-            continue
+    allowed = [t for t in candidates if t.allowed]
+    rejected = [t for t in candidates if not t.allowed]
 
-        candidates = []
-        for symbol in symbols:
-            if any(t.symbol == symbol for t in open_trades):
-                continue
-            raw = data[symbol]
-            dfs = {
-                "1w": closed_until(raw["1w"], "1w", now_ms, 80),
-                "1d": closed_until(raw["1d"], "1d", now_ms, 160),
-                "4h": closed_until(raw["4h"], "4h", now_ms, 220),
-                "1h": closed_until(raw["1h"], "1h", now_ms, 260),
-                "15m": closed_until(raw["15m"], "15m", now_ms, 300),
-            }
-            dfs["2h"] = aggregate(dfs["1h"], "2h", 160)
-            dfs["30m"] = aggregate(dfs["15m"], "30min", 220)
-            if min(len(dfs["1w"]), len(dfs["1d"]), len(dfs["4h"]), len(dfs["1h"]), len(dfs["15m"])) < 10:
-                continue
-            for sig in build_signals_for_symbol(symbol, dfs):
-                # Signal engines store signal_time as the OPEN time of the confirming candle.
-                # The backtester may only enter after that candle CLOSES.
-                available_at = signal_available_time(sig)
-                if available_at != pd.Timestamp(ts):
-                    continue
-                if sig.signal_id in seen_signals:
-                    continue
-                candidates.append(sig)
+    executed = [simulate_trade(t, history[t.symbol]["15m"]) for t in allowed]
 
-        candidates.sort(key=lambda s: (s.score, 1 if str(s.strategy).startswith("DLS") else 0), reverse=True)
-        slots = int(settings.backtest_max_open_positions) - len(open_trades)
-        take = min(slots, int(settings.backtest_max_new_trades_per_bar), len(candidates))
-        for sig in candidates[:take]:
-            risk_unit = abs(float(sig.entry) - float(sig.stop))
-            if risk_unit <= 0:
-                continue
-            risk_usdt = balance * float(settings.backtest_risk_per_trade)
-            log.warning(
-                "BACKTEST ENTRY %s %s %s entry=%.8f stop=%.8f target=%.8f strategy=%s",
-                sig.side.upper(), sig.symbol, sig.timeframe, float(sig.entry), float(sig.stop), float(sig.target), sig.strategy
-            )
-            open_trades.append(BacktestTrade(
-                symbol=sig.symbol,
-                strategy=sig.strategy,
-                side=sig.side,
-                timeframe=sig.timeframe,
-                entry_time=pd.Timestamp(ts).isoformat(),
-                entry=float(sig.entry),
-                stop=float(sig.stop),
-                target=float(sig.target),
-                break_even_price=float(sig.break_even_price),
-                risk_per_unit=risk_unit,
-                risk_usdt=risk_usdt,
-                signal_id=sig.signal_id,
-                reason=sig.reason,
-            ))
-            seen_signals.add(sig.signal_id)
+    closed = [t for t in executed if t.result != "OPEN"]
+    wins = [t for t in closed if t.result == "WIN"]
+    losses = [t for t in closed if t.result == "LOSS"]
+    bes = [t for t in closed if t.result == "BREAKEVEN"]
 
-    # Mark remaining open trades as OPEN at the final price.
-    for trade in list(open_trades):
-        m15 = data[trade.symbol]["15m"]
-        last_bar = m15.iloc[-1]
-        exit_price = float(last_bar.close)
-        r = (exit_price - trade.entry) / trade.risk_per_unit if trade.side == "buy" else (trade.entry - exit_price) / trade.risk_per_unit
-        row = {
-            **asdict(trade),
-            "exit_time": pd.Timestamp(last_bar.datetime).isoformat(),
-            "exit_price": exit_price,
-            "result": "OPEN",
-            "r": r,
-            "pnl_usdt": r * trade.risk_usdt,
-            "balance_after": balance,
+    balance = START_BALANCE
+    for tr in closed:
+        balance *= (1 + RISK_PER_TRADE * tr.r)
+
+    rejected_weekly = [t for t in rejected if "weekly mismatch" in t.reject_reason]
+    rejected_h4 = [t for t in rejected if "4H SPM" in t.reject_reason or "no 4H SPM" in t.reject_reason]
+
+    breakdown = {}
+    for strat in sorted(set(t.strategy for t in executed)):
+        rows = [t for t in executed if t.strategy == strat]
+        rows_closed = [t for t in rows if t.result != "OPEN"]
+        breakdown[strat] = {
+            "trades": len(rows),
+            "closed": len(rows_closed),
+            "wins": len([x for x in rows_closed if x.result == "WIN"]),
+            "losses": len([x for x in rows_closed if x.result == "LOSS"]),
+            "breakeven": len([x for x in rows_closed if x.result == "BREAKEVEN"]),
+            "net_r": round(sum(x.r for x in rows_closed), 2),
         }
-        closed_rows.append(row)
 
-    with open(settings.backtest_result_file, "w", newline="") as f:
-        if closed_rows:
-            writer = csv.DictWriter(f, fieldnames=list(closed_rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(closed_rows)
-        else:
-            writer = csv.writer(f)
-            writer.writerow(["no_trades_found"])
-
-    wins = sum(1 for r in closed_rows if str(r["result"]).startswith("WIN"))
-    losses = sum(1 for r in closed_rows if str(r["result"]).startswith("LOSS"))
-    breakeven = sum(1 for r in closed_rows if str(r["result"]).startswith("BREAKEVEN"))
-    open_count = sum(1 for r in closed_rows if r["result"] == "OPEN")
-    closed_count = wins + losses + breakeven
-    net_r = sum(float(r["r"]) for r in closed_rows if r["result"] != "OPEN")
     summary = {
         "version": VERSION,
-        "period_start_utc": start_dt.isoformat(),
-        "period_end_utc": end_dt.isoformat(),
+        "rr_target": RR_TARGET,
+        "break_even_r": BREAK_EVEN_R,
+        "period_days": BACKTEST_DAYS,
         "symbols": symbols,
-        "total_trades_found": len(closed_rows),
-        "closed_trades": closed_count,
-        "wins": wins,
-        "losses": losses,
-        "breakeven": breakeven,
-        "open_at_end": open_count,
-        "win_rate_closed_percent": round((wins / closed_count) * 100, 2) if closed_count else 0.0,
-        "net_r_closed": round(net_r, 4),
-        "start_balance": settings.backtest_start_balance,
+        "total_candidates_before_filters": len(candidates),
+        "rejected_total": len(rejected),
+        "rejected_weekly": len(rejected_weekly),
+        "rejected_4h_spm": len(rejected_h4),
+        "executed_trades": len(executed),
+        "closed_trades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "breakeven": len(bes),
+        "open_at_end": len([t for t in executed if t.result == "OPEN"]),
+        "win_rate_closed_percent": round((len(wins) / len(closed) * 100) if closed else 0, 2),
+        "net_r_closed": round(sum(t.r for t in closed), 2),
+        "start_balance": START_BALANCE,
         "end_balance_closed_only": round(balance, 4),
-        "risk_per_trade": settings.backtest_risk_per_trade,
-        "results_file": settings.backtest_result_file,
+        "use_weekly_filter": USE_WEEKLY_FILTER,
+        "use_4h_spm_filter": USE_4H_SPM_FILTER,
+        "strategy_breakdown": breakdown,
+        "results_file": "logs/backtest_results_filtered.csv",
+        "summary_file": "logs/backtest_summary_filtered.json",
     }
-    with open(settings.backtest_summary_file, "w") as f:
+
+    rows = [asdict(t) for t in executed + rejected]
+    pd.DataFrame(rows).to_csv("logs/backtest_results_filtered.csv", index=False)
+    with open("logs/backtest_summary_filtered.json", "w") as f:
         json.dump(summary, f, indent=2)
 
-    log.warning("BACKTEST COMPLETE: trades=%s closed=%s wins=%s losses=%s BE=%s open=%s winrate=%.2f%% netR=%.2f", summary["total_trades_found"], closed_count, wins, losses, breakeven, open_count, summary["win_rate_closed_percent"], summary["net_r_closed"])
+    log.warning("FILTERED BACKTEST COMPLETE")
     print(json.dumps(summary, indent=2))
-    return summary
 
 
 if __name__ == "__main__":
-    run_backtest()
+    main()
