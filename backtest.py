@@ -18,7 +18,7 @@ from bias_engine import weekly_bias, four_h_spm_allows
 from dls_engine import detect_dls_signals
 from ict_engine import detect_signal as detect_ict_signal
 
-VERSION = "master-ict-dls-bot-v2-backtest"
+VERSION = "master-ict-dls-bot-v3-backtest-timing-fix"
 
 TF_MS = {
     "15m": 15 * 60 * 1000,
@@ -142,6 +142,37 @@ def normalize_ict_signal(sig):
     return sig
 
 
+
+def signal_confirmation_timeframe(sig) -> str:
+    """Return the candle timeframe that actually confirms this signal.
+
+    Most signal_time values in the engines are the OPEN time of the confirming candle.
+    In backtesting, the signal is only tradable after that candle closes.
+    """
+    strategy = str(getattr(sig, "strategy", "")).upper()
+    tf = str(getattr(sig, "timeframe", "15m")).lower()
+
+    if strategy == "ICT":
+        return "15m"
+    if strategy == "DLS_TYPE1":
+        return tf if tf in TF_MS else "1h"
+    if strategy == "DLS_TYPE2":
+        # 1H Type2 confirms on 15M SPM, 2H Type2 confirms on 30M SPM.
+        if tf == "2h":
+            return "30m"
+        return "15m"
+    return tf if tf in TF_MS else "15m"
+
+
+def signal_available_time(sig) -> pd.Timestamp:
+    """Convert signal_time candle OPEN into the first time the backtester may enter."""
+    sig_time = pd.Timestamp(sig.signal_time)
+    if sig_time.tzinfo is None:
+        sig_time = sig_time.tz_localize("UTC")
+    confirm_tf = signal_confirmation_timeframe(sig)
+    return sig_time + pd.Timedelta(milliseconds=TF_MS[confirm_tf])
+
+
 def build_signals_for_symbol(symbol: str, dfs: Dict[str, pd.DataFrame]):
     bias, bias_reason = weekly_bias(dfs["1w"], dfs["1d"])
     if bias not in ("buy", "sell"):
@@ -255,8 +286,17 @@ def run_backtest():
     seen_signals = set()
     closed_rows = []
 
-    for ts in all_times:
+    total_bars = len(all_times)
+    log.info("Starting candle replay: bars=%s symbols=%s", total_bars, len(symbols))
+
+    for bar_i, ts in enumerate(all_times, start=1):
         now_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+
+        if bar_i == 1 or bar_i % 250 == 0 or bar_i == total_bars:
+            log.info(
+                "Backtest progress: %s/%s | time=%s | open=%s | closed=%s | balance=%.2f",
+                bar_i, total_bars, pd.Timestamp(ts).isoformat(), len(open_trades), len(closed_rows), balance
+            )
 
         # Manage all open trades on each 15m bar.
         for trade in list(open_trades):
@@ -277,6 +317,10 @@ def run_backtest():
                     "pnl_usdt": pnl,
                     "balance_after": balance,
                 }
+                log.warning(
+                    "BACKTEST EXIT %s %s result=%s r=%.2f exit=%.8f balance=%.2f",
+                    trade.strategy, trade.symbol, result, r, exit_price, balance
+                )
                 closed_rows.append(row)
                 open_trades.remove(trade)
 
@@ -302,11 +346,10 @@ def run_backtest():
             if min(len(dfs["1w"]), len(dfs["1d"]), len(dfs["4h"]), len(dfs["1h"]), len(dfs["15m"])) < 10:
                 continue
             for sig in build_signals_for_symbol(symbol, dfs):
-                # Only accept signals that confirm on the current backtest bar. This prevents historical old setups being opened late.
-                sig_time = pd.Timestamp(sig.signal_time)
-                if sig_time.tzinfo is None:
-                    sig_time = sig_time.tz_localize("UTC")
-                if sig_time != pd.Timestamp(ts):
+                # Signal engines store signal_time as the OPEN time of the confirming candle.
+                # The backtester may only enter after that candle CLOSES.
+                available_at = signal_available_time(sig)
+                if available_at != pd.Timestamp(ts):
                     continue
                 if sig.signal_id in seen_signals:
                     continue
@@ -320,6 +363,10 @@ def run_backtest():
             if risk_unit <= 0:
                 continue
             risk_usdt = balance * float(settings.backtest_risk_per_trade)
+            log.warning(
+                "BACKTEST ENTRY %s %s %s entry=%.8f stop=%.8f target=%.8f strategy=%s",
+                sig.side.upper(), sig.symbol, sig.timeframe, float(sig.entry), float(sig.stop), float(sig.target), sig.strategy
+            )
             open_trades.append(BacktestTrade(
                 symbol=sig.symbol,
                 strategy=sig.strategy,
