@@ -14,7 +14,7 @@ from mexc_client import MexcClient
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("filtered-backtest")
 
-VERSION = "backtest-weekly-4h-spm-filter-v2-self-contained"
+VERSION = "backtest-v6-dls1-candle3-stop-extended-dls"
 Side = Literal["buy", "sell"]
 
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
@@ -262,16 +262,23 @@ def detect_dls_candidates(symbol: str, df: pd.DataFrame, timeframe: str, t, week
     - Original 3-candle DLS.
     - Extended DLS where extra candles appear between Candle 2 and the final sweep candle.
 
-    BUY:
+    BUY DLS Type 1:
       C1 = reference candle.
-      C2 after C1 sweeps C1 high and closes weak below C1 high.
-      Extra candles between C2 and final sweep are allowed only if they do NOT take C1 high or C1 low.
-      Final sweep candle takes C1 low.
-      Type 1: final candle closes above C2 body top.
-      Type 2: final candle does NOT close above C2 open.
+      C2 sweeps C1 high and closes weak below C1 high.
+      Extra candle(s) may appear after C2 only if they stay inside C1 high/low.
+      Final candle sweeps C1 low and closes above C2 body top.
+      Entry = final candle close.
+      Stop = below final/Candle 3 low.
 
-    SELL:
-      Opposite.
+    BUY DLS Type 2:
+      Same sweep structure, but final candle does NOT close above C2 open.
+      This is counted separately as Type 2.
+
+    SELL logic is the opposite:
+      C2 sweeps C1 low and closes weak above C1 low.
+      Final candle sweeps C1 high.
+      Type 1 closes below C2 body bottom.
+      Stop = above final/Candle 3 high.
     """
     out = []
     d = df[df["datetime"] <= t].copy().reset_index(drop=True)
