@@ -10,12 +10,11 @@ import pandas as pd
 
 from config import settings
 from mexc_client import MexcClient
-from strategy import detect_dls_signal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("filtered-backtest")
 
-VERSION = "backtest-weekly-4h-spm-filter-v1"
+VERSION = "backtest-weekly-4h-spm-filter-v2-self-contained"
 Side = Literal["buy", "sell"]
 
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
@@ -27,6 +26,14 @@ USE_WEEKLY_FILTER = os.getenv("USE_WEEKLY_FILTER", "true").lower() == "true"
 USE_4H_SPM_FILTER = os.getenv("USE_4H_SPM_FILTER", "true").lower() == "true"
 
 os.makedirs("logs", exist_ok=True)
+
+
+@dataclass
+class SimpleSignal:
+    side: Side
+    entry: float
+    stop_loss: float
+    timeframe: str
 
 
 @dataclass
@@ -140,6 +147,7 @@ def detect_last_spm(df: pd.DataFrame, t, lookback: int = 160) -> Optional[SPM]:
         right = min(len(data), c2_i + 21)
         window = data.iloc[left:right]
 
+        # Bullish SPM: Candle 2 is lowest candle, confirm body close above Candle 1 high
         if float(data.iloc[c2_i]["low"]) == float(window["low"].min()):
             c1_i = find_valid_bull_c1(data, c2_i)
             if c1_i is not None:
@@ -151,6 +159,7 @@ def detect_last_spm(df: pd.DataFrame, t, lookback: int = 160) -> Optional[SPM]:
                     conf = confirms.iloc[0]
                     spms.append(SPM("buy", conf["datetime"], c1["datetime"], data.iloc[c2_i]["datetime"], level, float(data.iloc[c2_i]["low"])))
 
+        # Bearish SPM: Candle 2 is highest candle, confirm body close below Candle 1 low
         if float(data.iloc[c2_i]["high"]) == float(window["high"].max()):
             c1_i = find_valid_bear_c1(data, c2_i)
             if c1_i is not None:
@@ -200,13 +209,58 @@ def make_trade(symbol, strategy, side, entry, stop, t, weekly_bias, h4_spm):
     return BTTrade(symbol, strategy, side, str(t), float(entry), float(stop), float(target), float(be), weekly_bias, h4_spm, allowed, reject_reason)
 
 
+def detect_dls_type1(d: pd.DataFrame, timeframe: str) -> Optional[SimpleSignal]:
+    if len(d) < 3:
+        return None
+
+    c1 = d.iloc[-3]
+    c2 = d.iloc[-2]
+    c3 = d.iloc[-1]
+
+    c1_high = float(c1["high"])
+    c1_low = float(c1["low"])
+
+    c2_high = float(c2["high"])
+    c2_low = float(c2["low"])
+    c2_close = float(c2["close"])
+
+    c3_high = float(c3["high"])
+    c3_low = float(c3["low"])
+    c3_close = float(c3["close"])
+
+    c2_body_top = body_high(c2)
+    c2_body_bottom = body_low(c2)
+
+    # BUY Type 1
+    buy_ok = (
+        c2_high > c1_high and
+        c2_close < c1_high and
+        c3_low < c1_low and
+        c3_close > c2_body_top
+    )
+    if buy_ok and c3_close > c3_low:
+        return SimpleSignal("buy", c3_close, c3_low, timeframe)
+
+    # SELL Type 1
+    sell_ok = (
+        c2_low < c1_low and
+        c2_close > c1_low and
+        c3_high > c1_high and
+        c3_close < c2_body_bottom
+    )
+    if sell_ok and c3_high > c3_close:
+        return SimpleSignal("sell", c3_close, c3_high, timeframe)
+
+    return None
+
+
 def detect_dls_candidates(symbol: str, df: pd.DataFrame, timeframe: str, t, weekly_bias, h4_spm):
     out = []
     d = df[df["datetime"] <= t].copy().reset_index(drop=True)
     if len(d) < 3:
         return out
 
-    sig1 = detect_dls_signal(d, timeframe=timeframe, risk_reward=RR_TARGET, break_even_r=BREAK_EVEN_R)
+    sig1 = detect_dls_type1(d, timeframe)
     if sig1:
         tr = make_trade(symbol, "DLS_TYPE1", sig1.side, sig1.entry, sig1.stop_loss, t, weekly_bias, h4_spm)
         if tr:
@@ -219,6 +273,7 @@ def detect_dls_candidates(symbol: str, df: pd.DataFrame, timeframe: str, t, week
     c2_close, c2_open = float(c2["close"]), float(c2["open"])
     c3_high, c3_low, c3_close = float(c3["high"]), float(c3["low"]), float(c3["close"])
 
+    # DLS Type 2: DLS happens but C3 does not close beyond C2 open
     buy2 = c2_high > c1_high and c2_close < c1_high and c3_low < c1_low and c3_close <= c2_open
     if buy2:
         tr = make_trade(symbol, "DLS_TYPE2", "buy", c3_close, c3_low, t, weekly_bias, h4_spm)
@@ -319,11 +374,13 @@ def main():
             if idx % 500 == 0:
                 log.info("Replay %s progress %s/%s candidates=%s", symbol, idx, len(times), len(candidates))
 
+            # check 1H at the top of the hour
             if int(t.minute) == 0:
                 wb = weekly_bias_at(data["1w"], t)
                 h4s = h4_spm_side_at(data["4h"], t)
                 candidates.extend(detect_dls_candidates(symbol, data["1h"], "1h", t, wb, h4s))
 
+            # check 2H every 2 hours
             if int(t.minute) == 0 and int(t.hour) % 2 == 0:
                 wb = weekly_bias_at(data["1w"], t)
                 h4s = h4_spm_side_at(data["4h"], t)
