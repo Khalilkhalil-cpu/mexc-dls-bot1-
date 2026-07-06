@@ -1,181 +1,106 @@
-from __future__ import annotations
-from typing import Optional, List, Dict, Any
+from typing import Optional
+
 import pandas as pd
-from models import Signal
+
 from config import settings
-from spm_engine import latest_spm, has_ec_before_spm
+from models import Signal
 
 
 def body_high(row) -> float:
-    return max(float(row["open"]), float(row["close"]))
+    return max(float(row.open), float(row.close))
 
 
 def body_low(row) -> float:
-    return min(float(row["open"]), float(row["close"]))
+    return min(float(row.open), float(row.close))
 
 
-def candle_time(row):
-    return row.datetime if "datetime" in row.index else int(row.timestamp)
+def make_signal(symbol, side, strategy, timeframe, entry, stop, signal_time, reason) -> Optional[Signal]:
+    if side == "buy":
+        risk = entry - stop
+        if risk <= 0:
+            return None
+        target = entry + risk * settings.rr_target
+        be = entry + risk * settings.break_even_r
+    else:
+        risk = stop - entry
+        if risk <= 0:
+            return None
+        target = entry - risk * settings.rr_target
+        be = entry - risk * settings.break_even_r
 
-
-def _signal(symbol: str, side: str, timeframe: str, entry: float, stop: float, candle_time_value, strategy: str, reason: str) -> Optional[Signal]:
-    risk = abs(float(entry) - float(stop))
-    if risk <= 0:
-        return None
-    target = entry + risk * settings.risk_reward if side == "buy" else entry - risk * settings.risk_reward
-    be = entry + risk * settings.break_even_r if side == "buy" else entry - risk * settings.break_even_r
-    sid = f"{symbol}|{strategy}|{timeframe}|{side}|{pd.Timestamp(candle_time_value).isoformat()}|{round(entry,8)}|{round(stop,8)}"
     return Signal(
         symbol=symbol,
-        strategy=strategy,
         side=side,
+        strategy=strategy,
         timeframe=timeframe,
         entry=float(entry),
-        stop=float(stop),
-        target=float(target),
+        stop_loss=float(stop),
+        take_profit=float(target),
         break_even_price=float(be),
         risk_per_unit=float(risk),
-        signal_time=candle_time_value,
-        signal_id=sid,
-        score=100,
+        signal_time=int(signal_time),
+        signal_id=f"{symbol}|{strategy}|{timeframe}|{side}|{int(signal_time)}|{round(entry, 8)}|{round(stop, 8)}",
         reason=reason,
     )
 
 
-def detect_dls_type1(symbol: str, df: pd.DataFrame, timeframe: str) -> Optional[Signal]:
-    """DLS Type 1: the original immediate-entry model exactly as kept from the old bot."""
-    if df is None or len(df) < 3:
-        return None
-    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    entry = float(c3.close)
-    t = candle_time(c3)
-
-    buy_ok = (
-        float(c2.high) > float(c1.high) and
-        float(c2.close) < float(c1.high) and
-        float(c3.low) < float(c1.low) and
-        float(c3.close) > body_high(c2)
-    )
-    if buy_ok:
-        return _signal(symbol, "buy", timeframe, entry, float(c3.low), t, "DLS_TYPE1", "DLS Type 1 buy: immediate entry after C3 close")
-
-    sell_ok = (
-        float(c2.low) < float(c1.low) and
-        float(c2.close) > float(c1.low) and
-        float(c3.high) > float(c1.high) and
-        float(c3.close) < body_low(c2)
-    )
-    if sell_ok:
-        return _signal(symbol, "sell", timeframe, entry, float(c3.high), t, "DLS_TYPE1", "DLS Type 1 sell: immediate entry after C3 close")
-    return None
-
-
-def detect_dls_type2_candidate_at(df: pd.DataFrame, timeframe: str, end_idx: int) -> Optional[Dict[str, Any]]:
-    """DLS Type 2 candidate ending at end_idx. Needs lower timeframe EC + SPM before entry.
-
-    Type 2 starts like DLS but Candle 3 fails to close beyond Candle 2 open:
-    BUY: C3 takes C1 low but does not close above C2 open.
-    SELL: C3 takes C1 high but does not close below C2 open.
+def detect_dls(symbol: str, df: pd.DataFrame, timeframe: str) -> Optional[Signal]:
     """
-    if end_idx < 2 or end_idx >= len(df):
-        return None
-    c1, c2, c3 = df.iloc[end_idx - 2], df.iloc[end_idx - 1], df.iloc[end_idx]
-    t = candle_time(c3)
+    Extended DLS Type 1 and Type 2.
 
-    buy_ok = (
-        float(c2.high) > float(c1.high) and
-        float(c2.close) < float(c1.high) and
-        float(c3.low) < float(c1.low) and
-        float(c3.close) <= float(c2.open)
-    )
-    if buy_ok:
-        return {
-            "side": "buy", "timeframe": timeframe,
-            "c3_low": float(c3.low), "c3_high": float(c3.high),
-            "candle3_time": t, "candle3_index": end_idx,
-        }
+    BUY:
+      C2 sweeps C1 high and closes below C1 high.
+      Optional extra candles after C2 must stay inside C1 high/low.
+      Final candle takes C1 low.
+      Type 1: final candle closes above C2 body top => immediate entry.
+      Type 2: final candle does not close above C2 open => delayed model, but this live version allows it as its own signal.
 
-    sell_ok = (
-        float(c2.low) < float(c1.low) and
-        float(c2.close) > float(c1.low) and
-        float(c3.high) > float(c1.high) and
-        float(c3.close) >= float(c2.open)
-    )
-    if sell_ok:
-        return {
-            "side": "sell", "timeframe": timeframe,
-            "c3_low": float(c3.low), "c3_high": float(c3.high),
-            "candle3_time": t, "candle3_index": end_idx,
-        }
-    return None
+    SELL is opposite.
 
-
-def recent_dls_type2_candidates(df: pd.DataFrame, timeframe: str) -> List[Dict[str, Any]]:
-    if df is None or len(df) < 3:
-        return []
-    start = max(2, len(df) - int(settings.dls_type2_lookback))
-    found: List[Dict[str, Any]] = []
-    for idx in range(start, len(df)):
-        c = detect_dls_type2_candidate_at(df, timeframe, idx)
-        if c:
-            found.append(c)
-    return found
-
-
-def detect_dls_type2_confirmed(symbol: str, htf_df: pd.DataFrame, lower_df: pd.DataFrame, timeframe: str, lower_timeframe: str) -> Optional[Signal]:
-    candidates = recent_dls_type2_candidates(htf_df, timeframe)
-    if not candidates:
+    Stop:
+      BUY stop below final/Candle3 low.
+      SELL stop above final/Candle3 high.
+    """
+    d = df.copy().sort_values("timestamp").reset_index(drop=True)
+    if len(d) < 3:
         return None
 
-    # Use the latest candidate that gets EC + SPM confirmation.
-    for setup in reversed(candidates):
-        spm = latest_spm(lower_df, lower_timeframe, side=setup["side"], only_after_time=setup["candle3_time"])
-        if not spm:
-            continue
-        try:
-            lower = lower_df.reset_index(drop=True)
-            if spm.confirm_index - spm.candle2_index > int(settings.max_type2_confirmation_bars):
-                continue
-        except Exception:
-            pass
-        if not has_ec_before_spm(lower_df, spm):
-            continue
+    last_i = len(d) - 1
+    final_c = d.iloc[last_i]
+    first_c1 = max(0, last_i - settings.dls_max_extra_candles - 2)
 
-        entry = float(spm.confirm_close)
-        if setup["side"] == "buy":
-            # Stop below both original DLS C3 low and lower-TF SPM C2 low.
-            stop = min(float(setup["c3_low"]), float(spm.candle2_low))
-        else:
-            # Stop above both original DLS C3 high and lower-TF SPM C2 high.
-            stop = max(float(setup["c3_high"]), float(spm.candle2_high))
-        return _signal(
-            symbol,
-            setup["side"],
-            timeframe,
-            entry,
-            stop,
-            spm.confirm_time,
-            "DLS_TYPE2",
-            f"DLS Type 2 {setup['side']} on {timeframe}; EC + {lower_timeframe} SPM confirmed",
-        )
+    for c1_i in range(first_c1, last_i - 1):
+        c1 = d.iloc[c1_i]
+        c1_high, c1_low = float(c1.high), float(c1.low)
+
+        for c2_i in range(c1_i + 1, last_i):
+            c2 = d.iloc[c2_i]
+            middle = d.iloc[c2_i + 1:last_i]
+
+            if not middle.empty:
+                if bool(((middle.high >= c1_high) | (middle.low <= c1_low)).any()):
+                    continue
+
+            c2_high, c2_low = float(c2.high), float(c2.low)
+            c2_close, c2_open = float(c2.close), float(c2.open)
+            c2_body_top = body_high(c2)
+            c2_body_bottom = body_low(c2)
+
+            f_high, f_low, f_close = float(final_c.high), float(final_c.low), float(final_c.close)
+            signal_time = int(final_c.timestamp)
+
+            buy_structure = c2_high > c1_high and c2_close < c1_high and f_low < c1_low
+            if buy_structure:
+                if settings.enable_dls_type1 and f_close > c2_body_top:
+                    return make_signal(symbol, "buy", "DLS_TYPE1", timeframe, f_close, f_low, signal_time, "extended DLS Type1 buy")
+                if settings.enable_dls_type2 and f_close <= c2_open:
+                    return make_signal(symbol, "buy", "DLS_TYPE2", timeframe, f_close, f_low, signal_time, "extended DLS Type2 buy")
+
+            sell_structure = c2_low < c1_low and c2_close > c1_low and f_high > c1_high
+            if sell_structure:
+                if settings.enable_dls_type1 and f_close < c2_body_bottom:
+                    return make_signal(symbol, "sell", "DLS_TYPE1", timeframe, f_close, f_high, signal_time, "extended DLS Type1 sell")
+                if settings.enable_dls_type2 and f_close >= c2_open:
+                    return make_signal(symbol, "sell", "DLS_TYPE2", timeframe, f_close, f_high, signal_time, "extended DLS Type2 sell")
+
     return None
-
-
-def detect_dls_signals(symbol: str, dfs: dict) -> List[Signal]:
-    signals: List[Signal] = []
-    if settings.enable_dls_type1:
-        for tf in settings.dls_tf_list:
-            if tf in dfs:
-                sig = detect_dls_type1(symbol, dfs[tf], tf)
-                if sig:
-                    signals.append(sig)
-    if settings.enable_dls_type2:
-        if "1h" in dfs and "15m" in dfs:
-            sig = detect_dls_type2_confirmed(symbol, dfs["1h"], dfs["15m"], "1h", "15m")
-            if sig:
-                signals.append(sig)
-        if "2h" in dfs and "30m" in dfs:
-            sig = detect_dls_type2_confirmed(symbol, dfs["2h"], dfs["30m"], "2h", "30m")
-            if sig:
-                signals.append(sig)
-    return signals

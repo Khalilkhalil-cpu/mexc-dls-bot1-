@@ -1,553 +1,201 @@
-import os
+# Backtest helper.
+# Runs the same DLS/SPM weekly+4H filter logic over recent history.
+# For full detailed testing, use Railway command: python backtest.py
+
 import json
+import os
 import time
-import logging
-from dataclasses import dataclass, asdict
+from dataclasses import asdict
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Literal
 
 import pandas as pd
 
+from bias_engine import final_bias, h4_spm_filter
 from config import settings
+from dls_engine import detect_dls
+from ict_engine import detect_ict_signal
+from logger import log
 from mexc_client import MexcClient
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("filtered-backtest")
 
-VERSION = "backtest-v6-dls1-candle3-stop-extended-dls"
-Side = Literal["buy", "sell"]
-
-BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
-START_BALANCE = float(os.getenv("BACKTEST_START_BALANCE", "1000"))
-RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.02"))
-RR_TARGET = float(os.getenv("RR_TARGET", "2.0"))
-BREAK_EVEN_R = float(os.getenv("BREAK_EVEN_R", "0.82"))
-USE_WEEKLY_FILTER = os.getenv("USE_WEEKLY_FILTER", "true").lower() == "true"
-USE_4H_SPM_FILTER = os.getenv("USE_4H_SPM_FILTER", "true").lower() == "true"
-
-os.makedirs("logs", exist_ok=True)
-
-
-@dataclass
-class SimpleSignal:
-    side: Side
-    entry: float
-    stop_loss: float
-    timeframe: str
-
-
-@dataclass
-class BTTrade:
-    symbol: str
-    strategy: str
-    side: Side
-    entry_time: str
-    entry: float
-    stop: float
-    target: float
-    be_price: float
-    weekly_bias: str
-    h4_spm: str
-    allowed: bool
-    reject_reason: str = ""
-    exit_time: str = ""
-    exit_price: float = 0.0
-    result: str = "OPEN"
-    r: float = 0.0
-
-
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "datetime" not in df.columns:
-        df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    else:
-        df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    return df.sort_values("datetime").drop_duplicates("datetime").reset_index(drop=True)
-
-
-def body_high(row) -> float:
-    return max(float(row["open"]), float(row["close"]))
-
-
-def body_low(row) -> float:
-    return min(float(row["open"]), float(row["close"]))
-
-
-def is_inside_candle(df: pd.DataFrame, i: int) -> bool:
-    if i <= 0:
-        return False
-    c = df.iloc[i]
-    p = df.iloc[i - 1]
-    return float(c["high"]) <= float(p["high"]) and float(c["low"]) >= float(p["low"])
-
-
-def weekly_bias_at(weekly: pd.DataFrame, t) -> str:
-    w = weekly[weekly["datetime"] < t].copy()
-    if len(w) < 3:
-        return "neutral"
-    last_week = w.iloc[-1]
-    prev_week = w.iloc[-2]
-    if float(last_week["close"]) > float(prev_week["high"]):
-        return "buy"
-    if float(last_week["close"]) < float(prev_week["low"]):
-        return "sell"
-    return "neutral"
-
-
-@dataclass
-class SPM:
-    side: Side
-    confirmed_time: object
-    c1_time: object
-    c2_time: object
-    c1_level: float
-    c2_extreme: float
-
-
-def find_valid_bull_c1(df: pd.DataFrame, c2_i: int, max_back: int = 50) -> Optional[int]:
-    c2 = df.iloc[c2_i]
-    start = max(1, c2_i - max_back)
-    for i in range(c2_i - 1, start - 1, -1):
-        c1 = df.iloc[i]
-        if is_inside_candle(df, i):
-            continue
-        if float(c2["low"]) <= float(c1["low"]):
-            continue
-        if float(c2["close"]) < body_low(c1):
-            continue
-        return i
-    return None
-
-
-def find_valid_bear_c1(df: pd.DataFrame, c2_i: int, max_back: int = 50) -> Optional[int]:
-    c2 = df.iloc[c2_i]
-    start = max(1, c2_i - max_back)
-    for i in range(c2_i - 1, start - 1, -1):
-        c1 = df.iloc[i]
-        if is_inside_candle(df, i):
-            continue
-        if float(c2["high"]) >= float(c1["high"]):
-            continue
-        if float(c2["close"]) > body_high(c1):
-            continue
-        return i
-    return None
-
-
-def detect_last_spm(df: pd.DataFrame, t, lookback: int = 160) -> Optional[SPM]:
-    data = df[df["datetime"] < t].copy().reset_index(drop=True)
-    if len(data) < 30:
-        return None
-
-    start = max(5, len(data) - lookback)
-    spms = []
-
-    for c2_i in range(start, len(data) - 1):
-        left = max(0, c2_i - 20)
-        right = min(len(data), c2_i + 21)
-        window = data.iloc[left:right]
-
-        # Bullish SPM: Candle 2 is lowest candle, confirm body close above Candle 1 high
-        if float(data.iloc[c2_i]["low"]) == float(window["low"].min()):
-            c1_i = find_valid_bull_c1(data, c2_i)
-            if c1_i is not None:
-                c1 = data.iloc[c1_i]
-                level = float(c1["high"])
-                after = data.iloc[c2_i + 1:]
-                confirms = after[after["close"] > level]
-                if not confirms.empty:
-                    conf = confirms.iloc[0]
-                    spms.append(SPM("buy", conf["datetime"], c1["datetime"], data.iloc[c2_i]["datetime"], level, float(data.iloc[c2_i]["low"])))
-
-        # Bearish SPM: Candle 2 is highest candle, confirm body close below Candle 1 low
-        if float(data.iloc[c2_i]["high"]) == float(window["high"].max()):
-            c1_i = find_valid_bear_c1(data, c2_i)
-            if c1_i is not None:
-                c1 = data.iloc[c1_i]
-                level = float(c1["low"])
-                after = data.iloc[c2_i + 1:]
-                confirms = after[after["close"] < level]
-                if not confirms.empty:
-                    conf = confirms.iloc[0]
-                    spms.append(SPM("sell", conf["datetime"], c1["datetime"], data.iloc[c2_i]["datetime"], level, float(data.iloc[c2_i]["high"])))
-
-    if not spms:
-        return None
-    spms.sort(key=lambda x: x.confirmed_time)
-    return spms[-1]
-
-
-def h4_spm_side_at(h4: pd.DataFrame, t) -> str:
-    spm = detect_last_spm(h4, t)
-    return spm.side if spm else "none"
-
-
-def passes_filters(side: str, weekly_bias: str, h4_spm: str):
-    reasons = []
-    if USE_WEEKLY_FILTER and weekly_bias != "neutral" and weekly_bias != side:
-        reasons.append(f"weekly mismatch weekly={weekly_bias} trade={side}")
-    if USE_4H_SPM_FILTER:
-        if h4_spm == "none":
-            reasons.append("no 4H SPM")
-        elif h4_spm != side:
-            reasons.append(f"4H SPM mismatch h4={h4_spm} trade={side}")
-    return len(reasons) == 0, "; ".join(reasons)
-
-
-def make_trade(symbol, strategy, side, entry, stop, t, weekly_bias, h4_spm):
-    if side == "buy":
-        risk = entry - stop
-        target = entry + risk * RR_TARGET
-        be = entry + risk * BREAK_EVEN_R
-    else:
-        risk = stop - entry
-        target = entry - risk * RR_TARGET
-        be = entry - risk * BREAK_EVEN_R
-    if risk <= 0:
-        return None
-    allowed, reject_reason = passes_filters(side, weekly_bias, h4_spm)
-    return BTTrade(symbol, strategy, side, str(t), float(entry), float(stop), float(target), float(be), weekly_bias, h4_spm, allowed, reject_reason)
-
-
-def detect_dls_type1(d: pd.DataFrame, timeframe: str) -> Optional[SimpleSignal]:
-    if len(d) < 3:
-        return None
-
-    c1 = d.iloc[-3]
-    c2 = d.iloc[-2]
-    c3 = d.iloc[-1]
-
-    c1_high = float(c1["high"])
-    c1_low = float(c1["low"])
-
-    c2_high = float(c2["high"])
-    c2_low = float(c2["low"])
-    c2_close = float(c2["close"])
-
-    c3_high = float(c3["high"])
-    c3_low = float(c3["low"])
-    c3_close = float(c3["close"])
-
-    c2_body_top = body_high(c2)
-    c2_body_bottom = body_low(c2)
-
-    # BUY Type 1
-    buy_ok = (
-        c2_high > c1_high and
-        c2_close < c1_high and
-        c3_low < c1_low and
-        c3_close > c2_body_top
-    )
-    if buy_ok and c3_close > c3_low:
-        return SimpleSignal("buy", c3_close, c3_low, timeframe)
-
-    # SELL Type 1
-    sell_ok = (
-        c2_low < c1_low and
-        c2_close > c1_low and
-        c3_high > c1_high and
-        c3_close < c2_body_bottom
-    )
-    if sell_ok and c3_high > c3_close:
-        return SimpleSignal("sell", c3_close, c3_high, timeframe)
-
-    return None
-
-
-def detect_dls_candidates(symbol: str, df: pd.DataFrame, timeframe: str, t, weekly_bias, h4_spm):
-    """
-    Extended DLS detector.
-
-    Supports:
-    - Original 3-candle DLS.
-    - Extended DLS where extra candles appear between Candle 2 and the final sweep candle.
-
-    BUY DLS Type 1:
-      C1 = reference candle.
-      C2 sweeps C1 high and closes weak below C1 high.
-      Extra candle(s) may appear after C2 only if they stay inside C1 high/low.
-      Final candle sweeps C1 low and closes above C2 body top.
-      Entry = final candle close.
-      Stop = below final/Candle 3 low.
-
-    BUY DLS Type 2:
-      Same sweep structure, but final candle does NOT close above C2 open.
-      This is counted separately as Type 2.
-
-    SELL logic is the opposite:
-      C2 sweeps C1 low and closes weak above C1 low.
-      Final candle sweeps C1 high.
-      Type 1 closes below C2 body bottom.
-      Stop = above final/Candle 3 high.
-    """
-    out = []
-    d = df[df["datetime"] <= t].copy().reset_index(drop=True)
-    if len(d) < 3:
-        return out
-
-    max_extra = int(os.getenv("DLS_MAX_EXTRA_CANDLES", "3"))
-    last_i = len(d) - 1
-    final_c = d.iloc[last_i]
-
-    # Search for C1/C2 behind the final sweep candle.
-    # C1 -> C2 -> optional inside candles -> final sweep candle.
-    first_c1 = max(0, last_i - max_extra - 2)
-
-    for c1_i in range(first_c1, last_i - 1):
-        c1 = d.iloc[c1_i]
-        c1_high = float(c1["high"])
-        c1_low = float(c1["low"])
-
-        for c2_i in range(c1_i + 1, last_i):
-            c2 = d.iloc[c2_i]
-
-            # Any candles between C2 and final candle are allowed only if they stay inside C1 range.
-            middle = d.iloc[c2_i + 1:last_i]
-            if not middle.empty:
-                if bool(((middle["high"] >= c1_high) | (middle["low"] <= c1_low)).any()):
-                    continue
-
-            c2_high = float(c2["high"])
-            c2_low = float(c2["low"])
-            c2_close = float(c2["close"])
-            c2_open = float(c2["open"])
-            c2_body_top = body_high(c2)
-            c2_body_bottom = body_low(c2)
-
-            f_high = float(final_c["high"])
-            f_low = float(final_c["low"])
-            f_close = float(final_c["close"])
-
-            # BUY setup.
-            buy_structure = (
-                c2_high > c1_high and
-                c2_close < c1_high and
-                f_low < c1_low
-            )
-
-            if buy_structure:
-                if f_close > c2_body_top:
-                    tr = make_trade(symbol, "DLS_TYPE1_EXT", "buy", f_close, f_low, t, weekly_bias, h4_spm)
-                    if tr:
-                        out.append(tr)
-                    return out
-
-                if f_close <= c2_open:
-                    tr = make_trade(symbol, "DLS_TYPE2_EXT", "buy", f_close, f_low, t, weekly_bias, h4_spm)
-                    if tr:
-                        out.append(tr)
-                    return out
-
-            # SELL setup.
-            sell_structure = (
-                c2_low < c1_low and
-                c2_close > c1_low and
-                f_high > c1_high
-            )
-
-            if sell_structure:
-                if f_close < c2_body_bottom:
-                    tr = make_trade(symbol, "DLS_TYPE1_EXT", "sell", f_close, f_high, t, weekly_bias, h4_spm)
-                    if tr:
-                        out.append(tr)
-                    return out
-
-                if f_close >= c2_open:
-                    tr = make_trade(symbol, "DLS_TYPE2_EXT", "sell", f_close, f_high, t, weekly_bias, h4_spm)
-                    if tr:
-                        out.append(tr)
-                    return out
-
-    return out
-
-def simulate_trade(trade: BTTrade, m15: pd.DataFrame) -> BTTrade:
-    entry_time = pd.Timestamp(trade.entry_time)
-    future = m15[m15["datetime"] > entry_time].copy()
+def simulate(signal, m15):
+    entry_t = pd.Timestamp(signal.signal_time, unit="ms", tz="UTC")
+    future = m15[m15["datetime"] > entry_t].copy()
     moved_be = False
 
+    result = {
+        "symbol": signal.symbol,
+        "strategy": signal.strategy,
+        "side": signal.side,
+        "timeframe": signal.timeframe,
+        "entry_time": str(entry_t),
+        "entry": signal.entry,
+        "stop": signal.stop_loss,
+        "target": signal.take_profit,
+        "result": "OPEN",
+        "r": 0.0,
+        "exit_time": "",
+        "exit_price": None,
+    }
+
     for _, bar in future.iterrows():
-        high = float(bar["high"])
-        low = float(bar["low"])
-        dt = str(bar["datetime"])
+        high, low = float(bar.high), float(bar.low)
 
-        if trade.side == "buy":
-            if not moved_be and high >= trade.be_price:
+        if signal.side == "buy":
+            if not moved_be and high >= signal.break_even_price:
                 moved_be = True
-            active_stop = trade.entry if moved_be else trade.stop
-
+            active_stop = signal.entry if moved_be else signal.stop_loss
             if low <= active_stop:
-                trade.exit_time = dt
-                trade.exit_price = active_stop
-                trade.result = "BREAKEVEN" if moved_be else "LOSS"
-                trade.r = 0.0 if moved_be else -1.0
-                return trade
-
-            if high >= trade.target:
-                trade.exit_time = dt
-                trade.exit_price = trade.target
-                trade.result = "WIN"
-                trade.r = RR_TARGET
-                return trade
-
+                result["result"] = "BREAKEVEN" if moved_be else "LOSS"
+                result["r"] = 0.0 if moved_be else -1.0
+                result["exit_time"] = str(bar.datetime)
+                result["exit_price"] = active_stop
+                return result
+            if high >= signal.take_profit:
+                result["result"] = "WIN"
+                result["r"] = settings.rr_target
+                result["exit_time"] = str(bar.datetime)
+                result["exit_price"] = signal.take_profit
+                return result
         else:
-            if not moved_be and low <= trade.be_price:
+            if not moved_be and low <= signal.break_even_price:
                 moved_be = True
-            active_stop = trade.entry if moved_be else trade.stop
-
+            active_stop = signal.entry if moved_be else signal.stop_loss
             if high >= active_stop:
-                trade.exit_time = dt
-                trade.exit_price = active_stop
-                trade.result = "BREAKEVEN" if moved_be else "LOSS"
-                trade.r = 0.0 if moved_be else -1.0
-                return trade
+                result["result"] = "BREAKEVEN" if moved_be else "LOSS"
+                result["r"] = 0.0 if moved_be else -1.0
+                result["exit_time"] = str(bar.datetime)
+                result["exit_price"] = active_stop
+                return result
+            if low <= signal.take_profit:
+                result["result"] = "WIN"
+                result["r"] = settings.rr_target
+                result["exit_time"] = str(bar.datetime)
+                result["exit_price"] = signal.take_profit
+                return result
 
-            if low <= trade.target:
-                trade.exit_time = dt
-                trade.exit_price = trade.target
-                trade.result = "WIN"
-                trade.r = RR_TARGET
-                return trade
-
-    return trade
-
-
-
-def aggregate_2h_from_1h(df_1h: pd.DataFrame) -> pd.DataFrame:
-    df = df_1h.copy()
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
-    df = df.set_index("datetime")
-    agg = df.resample("2h", label="left", closed="left").agg({
-        "timestamp": "first" if "timestamp" in df.columns else "size",
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum" if "volume" in df.columns else "size",
-    }).dropna()
-    agg = agg.reset_index()
-    if "timestamp" not in agg.columns or agg["timestamp"].dtype == "object":
-        agg["timestamp"] = (agg["datetime"].astype("int64") // 1_000_000).astype("int64")
-    return agg.sort_values("datetime").reset_index(drop=True)
-
-
-def fetch_df(client, symbol, timeframe, limit):
-    return normalize_df(client.fetch_ohlcv_df(symbol, timeframe, limit))
+    return result
 
 
 def main():
+    os.makedirs("logs", exist_ok=True)
     client = MexcClient()
-    symbols = list(settings.backtest_symbol_list if hasattr(settings, 'backtest_symbol_list') else settings.symbol_list)
+    symbols = list(settings.backtest_symbol_list)
     now = datetime.now(timezone.utc)
-    start = now - timedelta(days=BACKTEST_DAYS)
+    start = now - timedelta(days=settings.backtest_days)
 
-    log.info("Starting filtered backtest %s | days=%s RR=%s weekly=%s h4spm=%s",
-             VERSION, BACKTEST_DAYS, RR_TARGET, USE_WEEKLY_FILTER, USE_4H_SPM_FILTER)
+    log.info("Starting backtest | days=%s risk=%s RR=%s symbols=%s", settings.backtest_days, settings.risk_per_trade, settings.rr_target, symbols)
 
-    history = {}
+    results = []
+    rejected = 0
+
     for symbol in symbols:
         log.info("Fetching %s", symbol)
-        df_1h = fetch_df(client, symbol, "1h", 2500)
-        df_2h = aggregate_2h_from_1h(df_1h)
-        history[symbol] = {
-            "1w": fetch_df(client, symbol, "1w", 80),
-            "4h": fetch_df(client, symbol, "4h", 1000),
-            "2h": df_2h,
-            "1h": df_1h,
-            "15m": fetch_df(client, symbol, "15m", 8000),
-        }
-        time.sleep(1)
+        df_1w = client.fetch_closed_df(symbol, "1w", 80)
+        time.sleep(settings.request_delay_seconds)
+        df_1d = client.fetch_closed_df(symbol, "1d", 260)
+        time.sleep(settings.request_delay_seconds)
+        df_4h = client.fetch_closed_df(symbol, "4h", 1000)
+        time.sleep(settings.request_delay_seconds)
+        df_1h = client.fetch_closed_df(symbol, "1h", 2500)
+        time.sleep(settings.request_delay_seconds)
+        df_2h = client.aggregate_2h_from_1h(df_1h, 1000)
+        df_15m = client.fetch_closed_df(symbol, "15m", 8000)
 
-    candidates = []
+        times = df_15m[(df_15m["datetime"] >= pd.Timestamp(start)) & (df_15m["datetime"] <= pd.Timestamp(now))]["datetime"]
 
-    for symbol, data in history.items():
-        times = data["15m"][(data["15m"]["datetime"] >= pd.Timestamp(start)) & (data["15m"]["datetime"] <= pd.Timestamp(now))]["datetime"]
-
+        seen = set()
         for idx, t in enumerate(times):
             if idx % 500 == 0:
-                log.info("Replay %s progress %s/%s candidates=%s", symbol, idx, len(times), len(candidates))
+                log.info("Replay %s %s/%s results=%s rejected=%s", symbol, idx, len(times), len(results), rejected)
 
-            # check 1H at the top of the hour
-            if int(t.minute) == 0:
-                wb = weekly_bias_at(data["1w"], t)
-                h4s = h4_spm_side_at(data["4h"], t)
-                candidates.extend(detect_dls_candidates(symbol, data["1h"], "1h", t, wb, h4s))
+            if int(t.minute) != 0:
+                continue
 
-            # check 2H every 2 hours
-            if int(t.minute) == 0 and int(t.hour) % 2 == 0:
-                wb = weekly_bias_at(data["1w"], t)
-                h4s = h4_spm_side_at(data["4h"], t)
-                candidates.extend(detect_dls_candidates(symbol, data["2h"], "2h", t, wb, h4s))
+            hist_1w = df_1w[df_1w.datetime <= t]
+            hist_1d = df_1d[df_1d.datetime <= t]
+            hist_4h = df_4h[df_4h.datetime <= t]
+            hist_1h = df_1h[df_1h.datetime <= t]
+            hist_2h = df_2h[df_2h.datetime <= t]
+            hist_15m = df_15m[df_15m.datetime <= t]
 
-    # dedupe
-    unique = {}
-    for tr in candidates:
-        key = (tr.symbol, tr.strategy, tr.side, tr.entry_time, round(tr.entry, 8), round(tr.stop, 8))
-        unique[key] = tr
-    candidates = list(unique.values())
+            if len(hist_1w) < 3 or len(hist_4h) < 30:
+                continue
 
-    allowed = [t for t in candidates if t.allowed]
-    rejected = [t for t in candidates if not t.allowed]
+            bias = final_bias(hist_1w, hist_1d)
+            if bias == "neutral":
+                rejected += 1
+                continue
 
-    executed = [simulate_trade(t, history[t.symbol]["15m"]) for t in allowed]
+            ok4h, reason4h = h4_spm_filter(hist_4h, bias)
+            if not ok4h:
+                rejected += 1
+                continue
 
-    closed = [t for t in executed if t.result != "OPEN"]
-    wins = [t for t in closed if t.result == "WIN"]
-    losses = [t for t in closed if t.result == "LOSS"]
-    bes = [t for t in closed if t.result == "BREAKEVEN"]
+            candidates = []
 
-    balance = START_BALANCE
-    for tr in closed:
-        balance *= (1 + RISK_PER_TRADE * tr.r)
+            sig = detect_dls(symbol, hist_1h, "1h")
+            if sig and sig.side == bias:
+                candidates.append(sig)
 
-    rejected_weekly = [t for t in rejected if "weekly mismatch" in t.reject_reason]
-    rejected_h4 = [t for t in rejected if "4H SPM" in t.reject_reason or "no 4H SPM" in t.reject_reason]
+            if int(t.hour) % 2 == 0:
+                sig = detect_dls(symbol, hist_2h, "2h")
+                if sig and sig.side == bias:
+                    candidates.append(sig)
+
+            sig = detect_ict_signal(symbol, bias, hist_4h, hist_1h, hist_15m)
+            if sig:
+                candidates.append(sig)
+
+            for sig in candidates:
+                if sig.signal_id in seen:
+                    continue
+                seen.add(sig.signal_id)
+                results.append(simulate(sig, df_15m))
+
+    closed = [r for r in results if r["result"] != "OPEN"]
+    wins = [r for r in closed if r["result"] == "WIN"]
+    losses = [r for r in closed if r["result"] == "LOSS"]
+    be = [r for r in closed if r["result"] == "BREAKEVEN"]
+    net_r = sum(r["r"] for r in closed)
+
+    balance = settings.backtest_start_balance
+    for r in closed:
+        balance *= (1 + settings.risk_per_trade * r["r"])
 
     breakdown = {}
-    for strat in sorted(set(t.strategy for t in executed)):
-        rows = [t for t in executed if t.strategy == strat]
-        rows_closed = [t for t in rows if t.result != "OPEN"]
+    for strat in sorted(set(r["strategy"] for r in results)):
+        rows = [r for r in closed if r["strategy"] == strat]
         breakdown[strat] = {
-            "trades": len(rows),
-            "closed": len(rows_closed),
-            "wins": len([x for x in rows_closed if x.result == "WIN"]),
-            "losses": len([x for x in rows_closed if x.result == "LOSS"]),
-            "breakeven": len([x for x in rows_closed if x.result == "BREAKEVEN"]),
-            "net_r": round(sum(x.r for x in rows_closed), 2),
+            "closed": len(rows),
+            "wins": len([x for x in rows if x["result"] == "WIN"]),
+            "losses": len([x for x in rows if x["result"] == "LOSS"]),
+            "breakeven": len([x for x in rows if x["result"] == "BREAKEVEN"]),
+            "net_r": round(sum(x["r"] for x in rows), 2),
         }
 
     summary = {
-        "version": VERSION,
-        "rr_target": RR_TARGET,
-        "break_even_r": BREAK_EVEN_R,
-        "period_days": BACKTEST_DAYS,
-        "symbols": symbols,
-        "total_candidates_before_filters": len(candidates),
-        "rejected_total": len(rejected),
-        "rejected_weekly": len(rejected_weekly),
-        "rejected_4h_spm": len(rejected_h4),
-        "executed_trades": len(executed),
-        "closed_trades": len(closed),
+        "risk_per_trade": settings.risk_per_trade,
+        "rr_target": settings.rr_target,
+        "break_even_r": settings.break_even_r,
+        "total_trades": len(results),
+        "closed": len(closed),
         "wins": len(wins),
         "losses": len(losses),
-        "breakeven": len(bes),
-        "open_at_end": len([t for t in executed if t.result == "OPEN"]),
-        "win_rate_closed_percent": round((len(wins) / len(closed) * 100) if closed else 0, 2),
-        "net_r_closed": round(sum(t.r for t in closed), 2),
-        "start_balance": START_BALANCE,
-        "end_balance_closed_only": round(balance, 4),
-        "use_weekly_filter": USE_WEEKLY_FILTER,
-        "use_4h_spm_filter": USE_4H_SPM_FILTER,
-        "strategy_breakdown": breakdown,
-        "results_file": "logs/backtest_results_filtered.csv",
-        "summary_file": "logs/backtest_summary_filtered.json",
+        "breakeven": len(be),
+        "win_rate": round((len(wins) / len(closed) * 100) if closed else 0, 2),
+        "net_r": round(net_r, 2),
+        "start_balance": settings.backtest_start_balance,
+        "end_balance": round(balance, 4),
+        "rejected_bias_or_4h": rejected,
+        "breakdown": breakdown,
     }
 
-    rows = [asdict(t) for t in executed + rejected]
-    pd.DataFrame(rows).to_csv("logs/backtest_results_filtered.csv", index=False)
-    with open("logs/backtest_summary_filtered.json", "w") as f:
+    pd.DataFrame(results).to_csv(settings.backtest_result_file, index=False)
+    with open(settings.backtest_summary_file, "w") as f:
         json.dump(summary, f, indent=2)
 
-    log.warning("FILTERED BACKTEST COMPLETE")
+    log.warning("BACKTEST COMPLETE")
     print(json.dumps(summary, indent=2))
 
 

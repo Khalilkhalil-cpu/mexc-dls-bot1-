@@ -1,1 +1,1 @@
-worker: python backtest.py
+worker: python main.py

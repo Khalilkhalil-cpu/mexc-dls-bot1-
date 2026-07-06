@@ -1,37 +1,45 @@
-from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Literal
+
 import pandas as pd
-from spm_engine import latest_spm
+
+from config import settings
+from spm_engine import detect_last_spm
+
+Bias = Literal["buy", "sell", "neutral"]
 
 
-def weekly_bias(w1: pd.DataFrame, d1: pd.DataFrame) -> Tuple[Optional[str], str]:
-    """Hard weekly rule first. Daily SPM only if weekly is neutral.
-    Weekly close above previous weekly high -> buy only, ignore daily.
-    Weekly close below previous weekly low -> sell only, ignore daily.
-    Otherwise use Daily SPM fallback; if no daily sell SPM, keep buy-only per user's rule.
-    """
-    if w1 is None or len(w1) < 3:
-        return None, "not enough weekly candles"
-    last = w1.iloc[-2]
-    prev = w1.iloc[-3]
-    if float(last.close) > float(prev.high):
-        return "buy", "weekly close above previous weekly high -> BUY ONLY"
-    if float(last.close) < float(prev.low):
-        return "sell", "weekly close below previous weekly low -> SELL ONLY"
+def weekly_bias(df_1w: pd.DataFrame) -> Bias:
+    if len(df_1w) < 3:
+        return "neutral"
+    last_week = df_1w.iloc[-2] if len(df_1w) > 2 else df_1w.iloc[-1]
+    prev_week = df_1w.iloc[-3] if len(df_1w) > 2 else df_1w.iloc[-2]
 
-    # Weekly did not close above previous high: check Daily SPM.
-    daily_last = latest_spm(d1, "1d") if d1 is not None and len(d1) > 10 else None
-    if daily_last and daily_last.side == "sell":
-        return "sell", "weekly neutral/below prev high and latest Daily SPM is SELL -> SELL ONLY"
-    if daily_last and daily_last.side == "buy":
-        return "buy", "weekly neutral and latest Daily SPM is BUY -> BUY ONLY"
-    return "buy", "weekly neutral and no Daily SELL SPM -> keep BUY ONLY"
+    if float(last_week.close) > float(prev_week.high):
+        return "buy"
+    if float(last_week.close) < float(prev_week.low):
+        return "sell"
+    return "neutral"
 
 
-def four_h_spm_allows(h4: pd.DataFrame, desired_side: str) -> Tuple[bool, str]:
-    spm = latest_spm(h4, "4h") if h4 is not None and len(h4) > 10 else None
+def daily_spm_fallback(df_1d: pd.DataFrame, weekly: Bias) -> Bias:
+    # Only used when weekly is neutral.
+    if weekly != "neutral":
+        return weekly
+    spm = detect_last_spm(df_1d, settings.spm_search_back, settings.spm_candle1_search_back)
+    return spm.side if spm else "neutral"
+
+
+def final_bias(df_1w: pd.DataFrame, df_1d: pd.DataFrame) -> Bias:
+    wb = weekly_bias(df_1w)
+    if wb != "neutral":
+        return wb
+    return daily_spm_fallback(df_1d, wb)
+
+
+def h4_spm_filter(df_4h: pd.DataFrame, desired_side: str) -> tuple[bool, str]:
+    spm = detect_last_spm(df_4h, settings.spm_search_back, settings.spm_candle1_search_back)
     if not spm:
-        return False, "no 4H SPM yet"
+        return False, "no 4H SPM"
     if spm.side != desired_side:
-        return False, f"latest 4H SPM is {spm.side.upper()}, waiting for {desired_side.upper()} SPM"
-    return True, f"latest 4H SPM agrees: {desired_side.upper()}"
+        return False, f"4H SPM mismatch: last={spm.side}, signal={desired_side}"
+    return True, f"4H SPM matched {spm.side}"

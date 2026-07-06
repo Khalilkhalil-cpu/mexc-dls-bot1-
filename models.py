@@ -3,35 +3,35 @@ from typing import Literal, Optional
 
 Side = Literal["buy", "sell"]
 
+
 @dataclass
 class Signal:
     symbol: str
     side: Side
+    strategy: str
+    timeframe: str
     entry: float
-    stop: float
-    target: float
-    signal_time: object
+    stop_loss: float
+    take_profit: float
+    break_even_price: float
+    risk_per_unit: float
+    signal_time: int
     signal_id: str
-    strategy: str = "ICT"
-    timeframe: str = ""
-    break_even_price: float = 0.0
-    risk_per_unit: float = 0.0
-    score: int = 100
     reason: str = ""
 
+
 @dataclass
-class SpmPoint:
+class OpenTrade:
+    trade_id: str
+    symbol: str
     side: Side
+    strategy: str
     timeframe: str
-    model: str
-    candle1_index: int
-    candle2_index: int
-    confirm_index: int
-    candle1_time: object
-    candle2_time: object
-    confirm_time: object
-    candle1_high: float
-    candle1_low: float
-    candle2_high: float
-    candle2_low: float
-    confirm_close: float
+    amount: float
+    entry: float
+    stop_loss: float
+    take_profit: float
+    break_even_price: float
+    risk_per_unit: float
+    opened_at: int
+    break_even_moved: bool = False

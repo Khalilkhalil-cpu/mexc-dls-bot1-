@@ -1,180 +1,163 @@
 import time
-from datetime import datetime, timezone, timedelta
+import traceback
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from bias_engine import final_bias, h4_spm_filter
 from config import settings
+from dls_engine import detect_dls
+from ict_engine import detect_ict_signal
 from logger import log
 from mexc_client import MexcClient
-from risk import position_size
+from order_manager import OrderManager
+from risk_manager import position_size, should_move_to_break_even, exit_reason
 from trade_manager import TradeManager
-from bias_engine import weekly_bias, four_h_spm_allows
-from dls_engine import detect_dls_signals
-from ict_engine import detect_signal as detect_ict_signal
-from journal import get_stats
 
-VERSION = "master-ict-dls-bot-v1"
+
+BOT_VERSION = "master-ict-dls-spm-live-v1-risk3-rr3"
 SEEN_SIGNALS = set()
-LAST_TRADE = {}
-LAST_NY_SESSION_DATE = None
 
 
-def in_ny_session():
-    now = datetime.now(ZoneInfo("America/New_York"))
-    start = now.replace(hour=settings.ny_start_hour, minute=0, second=0, microsecond=0)
-    end = now.replace(hour=settings.ny_end_hour, minute=settings.ny_end_minute, second=0, microsecond=0)
-    return start <= now <= end
-
-
-def reset_seen_at_ny_open():
-    global LAST_NY_SESSION_DATE
-    now = datetime.now(ZoneInfo("America/New_York"))
-    if now.hour >= settings.ny_start_hour:
-        if LAST_NY_SESSION_DATE != now.date():
-            SEEN_SIGNALS.clear()
-            LAST_NY_SESSION_DATE = now.date()
-            log.warning("New York session reset: cleared seen signals")
-
-
-def cooldown_ok(symbol):
-    last = LAST_TRADE.get(symbol)
-    if not last:
+def in_newyork_session() -> bool:
+    if "NEWYORK" not in settings.trading_sessions.upper():
         return True
-    return datetime.now(timezone.utc) - last > timedelta(minutes=settings.cooldown_minutes)
+    now = datetime.now(ZoneInfo("America/New_York"))
+    if now.hour < settings.ny_start_hour:
+        return False
+    if now.hour > settings.ny_end_hour:
+        return False
+    if now.hour == settings.ny_end_hour and now.minute > settings.ny_end_minute:
+        return False
+    return True
 
 
-def fetch_symbol_data(client, symbol):
-    d = {}
-    d["1w"] = client.fetch_ohlcv_df(symbol, "1w", 80)
-    d["1d"] = client.fetch_ohlcv_df(symbol, "1d", 160)
-    d["4h"] = client.fetch_ohlcv_df(symbol, "4h", 220)
-    d["1h"] = client.fetch_ohlcv_df(symbol, "1h", 260)
-    d["15m"] = client.fetch_ohlcv_df(symbol, "15m", 300)
-    # Build synthetic TFs to reduce MEXC requests.
-    d["2h"] = client.fetch_2h_from_1h(symbol, 160)
-    d["30m"] = client.fetch_30m_from_15m(symbol, 220)
-    return d
+def manage_open_trades(client, trades, orders):
+    for trade in list(trades.open_trades):
+        try:
+            price = client.last_price(trade.symbol)
+
+            if should_move_to_break_even(trade, price):
+                trade.stop_loss = trade.entry
+                trade.break_even_moved = True
+                log.warning("Moved SL to break-even: %s", trade.trade_id)
+
+            reason = exit_reason(trade, price)
+            if reason:
+                orders.close_trade(trade, reason, price)
+
+            time.sleep(settings.request_delay_seconds)
+        except Exception as exc:
+            log.error("Error managing trade %s: %s", trade.trade_id, exc)
+            log.error(traceback.format_exc())
 
 
-def normalize_ict_signal(sig):
-    sig.strategy = "ICT"
-    sig.timeframe = "15m"
-    risk = abs(sig.entry - sig.stop)
-    sig.risk_per_unit = risk
-    sig.break_even_price = sig.entry + risk * settings.break_even_r if sig.side == "buy" else sig.entry - risk * settings.break_even_r
-    sig.signal_id = f"{sig.symbol}|ICT|{sig.side}|{sig.signal_time}|{round(sig.entry,8)}|{round(sig.stop,8)}"
-    return sig
-
-
-def build_signals_for_symbol(client, symbol):
-    dfs = fetch_symbol_data(client, symbol)
-    bias, bias_reason = weekly_bias(dfs["1w"], dfs["1d"])
-    if bias not in ("buy", "sell"):
-        log.info("No bias: %s | %s", symbol, bias_reason)
-        return []
-    ok4h, reason4h = four_h_spm_allows(dfs["4h"], bias)
-    if not ok4h:
-        log.info("SPM filter blocked %s | bias=%s | %s | %s", symbol, bias, bias_reason, reason4h)
-        return []
-
+def build_symbol_signals(client, symbol):
     signals = []
+
+    df_1w = client.fetch_closed_df(symbol, "1w", 80)
+    time.sleep(settings.request_delay_seconds)
+    df_1d = client.fetch_closed_df(symbol, "1d", 260)
+    time.sleep(settings.request_delay_seconds)
+    df_4h = client.fetch_closed_df(symbol, "4h", 1000)
+    time.sleep(settings.request_delay_seconds)
+    df_1h = client.fetch_closed_df(symbol, "1h", 600)
+    time.sleep(settings.request_delay_seconds)
+    df_2h = client.aggregate_2h_from_1h(df_1h, 300)
+    df_15m = client.fetch_closed_df(symbol, "15m", 1000)
+    time.sleep(settings.request_delay_seconds)
+
+    bias = final_bias(df_1w, df_1d)
+    if bias == "neutral":
+        return [], "neutral bias"
+
+    ok4h, reason4h = h4_spm_filter(df_4h, bias)
+    if not ok4h:
+        return [], reason4h
+
     if settings.enable_dls:
-        for s in detect_dls_signals(symbol, dfs):
-            if s.side == bias:
-                s.reason = f"{bias_reason}; {reason4h}; {s.reason}"
-                signals.append(s)
-            else:
-                log.info("DLS signal blocked by bias: %s %s vs %s", symbol, s.side, bias)
+        for tf, df in (("1h", df_1h), ("2h", df_2h)):
+            if tf not in settings.dls_tf_list:
+                continue
+            sig = detect_dls(symbol, df, tf)
+            if sig and sig.side == bias:
+                signals.append(sig)
 
     if settings.enable_ict:
-        ict, msg = detect_ict_signal(symbol, dfs["1d"], dfs["4h"], dfs["1h"], dfs["15m"])
-        if ict:
-            ict = normalize_ict_signal(ict)
-            if ict.side == bias:
-                ict.reason = f"{bias_reason}; {reason4h}; {ict.reason}"
-                signals.append(ict)
-            else:
-                log.info("ICT signal blocked by bias: %s %s vs %s", symbol, ict.side, bias)
-        else:
-            log.info("No ICT setup: %s | %s", symbol, msg)
+        sig = detect_ict_signal(symbol, bias, df_4h, df_1h, df_15m)
+        if sig:
+            signals.append(sig)
 
-    return signals
+    return signals, f"bias={bias}; {reason4h}"
 
 
 def main():
-    log.info("Starting MASTER BOT | version=%s", VERSION)
-    log.info("DryRun=%s LiveOrders=%s Risk=%s Leverage=%sx MaxOpen=%s MaxPerCycle=%s", settings.dry_run, settings.use_live_orders, settings.risk_per_trade, settings.leverage, settings.max_open_positions, settings.max_new_trades_per_cycle)
+    log.info("Starting MASTER BOT | version=%s", BOT_VERSION)
+    log.info("DryRun=%s LiveOrders=%s Risk=%s RR=%s Leverage=%sx MaxOpen=%s MaxPerCycle=%s",
+             settings.dry_run, settings.use_live_orders, settings.risk_per_trade, settings.rr_target,
+             settings.leverage, settings.max_open_positions, settings.max_new_trades_per_cycle)
+
     client = MexcClient()
     trades = TradeManager()
-    symbols = list(client.valid_symbols())
-    log.info("Symbols=%s", tuple(symbols))
+    orders = OrderManager(client, trades)
 
     while True:
         try:
-            reset_seen_at_ny_open()
-            trades.manage(client)
+            manage_open_trades(client, trades, orders)
 
-            if "NEWYORK" in settings.trading_sessions.upper() and not in_ny_session():
+            if not in_newyork_session():
                 log.info("Outside New York session - no analysis")
                 time.sleep(settings.loop_seconds)
                 continue
 
-            open_count = len(client.open_positions()) + len(trades.open_trades)
-            if open_count >= settings.max_open_positions:
-                log.info("Max open positions reached: %s", open_count)
-                time.sleep(settings.loop_seconds)
-                continue
+            opened_this_cycle = 0
 
-            all_signals = []
-            for symbol in symbols[:settings.max_symbols_per_cycle]:
+            for symbol in settings.symbol_list:
+                if len(trades.open_trades) >= settings.max_open_positions:
+                    break
+                if opened_this_cycle >= settings.max_new_trades_per_cycle:
+                    break
+                if trades.has_open_symbol(symbol):
+                    continue
+
                 try:
-                    if not cooldown_ok(symbol):
-                        log.info("Cooldown active: %s", symbol)
+                    signals, reason = build_symbol_signals(client, symbol)
+                    if not signals:
+                        log.info("No setup %s | %s", symbol, reason)
+                        time.sleep(settings.symbol_delay_seconds)
                         continue
-                    if client.has_position(symbol):
-                        log.info("Exchange position already open: %s", symbol)
-                        continue
-                    sigs = build_signals_for_symbol(client, symbol)
-                    for sig in sigs:
-                        if sig.signal_id in SEEN_SIGNALS or trades.has_signal(sig.signal_id):
-                            log.info("Duplicate signal skipped: %s", sig.signal_id)
+
+                    for signal in signals:
+                        if signal.signal_id in SEEN_SIGNALS:
                             continue
-                        all_signals.append(sig)
-                except Exception as e:
-                    msg = str(e)
-                    log.exception("Error scanning %s: %s", symbol, e)
-                    if "Requests are too frequent" in msg or "code\":510" in msg:
-                        log.warning("Rate limit hit - backing off %s seconds", settings.rate_limit_backoff_seconds)
-                        time.sleep(settings.rate_limit_backoff_seconds)
-                time.sleep(settings.symbol_delay_seconds)
+                        SEEN_SIGNALS.add(signal.signal_id)
 
-            all_signals.sort(key=lambda s: (s.score, 1 if s.strategy.startswith("DLS") else 0), reverse=True)
-            slots = max(0, settings.max_open_positions - (len(client.open_positions()) + len(trades.open_trades)))
-            take = min(slots, settings.max_new_trades_per_cycle, len(all_signals))
-            if all_signals:
-                log.warning("Signals found=%s | taking=%s", len(all_signals), take)
+                        amount = position_size(client, signal)
+                        if amount <= 0:
+                            log.warning("Invalid amount for %s", signal.signal_id)
+                            continue
 
-            for sig in all_signals[:take]:
-                try:
-                    amount = position_size(client, sig.symbol, sig.entry, sig.stop)
-                    if amount <= 0:
-                        log.warning("Invalid amount for signal: %s", sig.signal_id)
-                        continue
-                    log.warning("TRADE %s %s %s entry=%s sl=%s tp=%s amount=%s | %s", sig.strategy, sig.side.upper(), sig.symbol, sig.entry, sig.stop, sig.target, amount, sig.reason)
-                    client.configure_futures(sig.symbol, sig.side)
-                    side = "buy" if sig.side == "buy" else "sell"
-                    client.create_market_order(sig.symbol, side, amount, reduce_only=False)
-                    trades.add(sig, amount)
-                    SEEN_SIGNALS.add(sig.signal_id)
-                    LAST_TRADE[sig.symbol] = datetime.now(timezone.utc)
-                except Exception as e:
-                    log.exception("Order failed %s: %s", sig.symbol, e)
+                        log.warning("SIGNAL %s %s %s entry=%s sl=%s tp=%s amount=%s reason=%s",
+                                    signal.strategy, signal.side.upper(), signal.symbol,
+                                    signal.entry, signal.stop_loss, signal.take_profit, amount, signal.reason)
 
-            stats = get_stats()
-            log.info("Stats: wins=%s losses=%s breakeven=%s total=%s netR=%.2f", stats.get("wins"), stats.get("losses"), stats.get("breakeven"), stats.get("total_closed"), float(stats.get("net_r",0)))
+                        orders.open_signal(signal, amount)
+                        opened_this_cycle += 1
+                        break
+
+                    time.sleep(settings.symbol_delay_seconds)
+
+                except Exception as exc:
+                    log.error("Error scanning %s: %s", symbol, exc)
+                    log.error(traceback.format_exc())
+                    time.sleep(settings.rate_limit_backoff_seconds)
+
             time.sleep(settings.loop_seconds)
-        except Exception as e:
-            log.exception("Main loop error: %s", e)
+
+        except Exception as exc:
+            log.error("Main loop error: %s", exc)
+            log.error(traceback.format_exc())
             time.sleep(settings.rate_limit_backoff_seconds)
+
 
 if __name__ == "__main__":
     main()
